@@ -2,6 +2,13 @@
 FROM node:22-alpine AS build
 WORKDIR /app
 
+COPY certs/ /usr/local/share/ca-certificates/extra/
+RUN if find /usr/local/share/ca-certificates/extra -name '*.crt' 2>/dev/null | grep -q .; then \
+      apk add --no-cache ca-certificates && \
+      update-ca-certificates; \
+    fi
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
 COPY package.json ./
 RUN npm install
 

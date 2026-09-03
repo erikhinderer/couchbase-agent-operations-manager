@@ -131,6 +131,19 @@ or, for a clearer view of the multi-container startup sequence:
 ./start.sh
 ```
 
+> **On a corporate laptop behind a TLS-inspecting proxy** (Zscaler, Netskope,
+> Palo Alto GlobalProtect, etc.), `pip install`/`npm install` inside the build
+> containers will fail with a self-signed-certificate error unless they trust
+> your org's proxy CA. Run this once first:
+>
+> ```bash
+> ./scripts/setup-corporate-ca.sh
+> ```
+>
+> It exports the CA(s) your Mac already trusts into `certs/` (gitignored,
+> machine-specific) so the Docker builds - and the operations-manager
+> container's embedding-model download at startup - can trust them too.
+
 First boot downloads the Couchbase Enterprise image and a local embedding
 model (~100MB, cached afterwards) - give it a few minutes. Then open:
 

@@ -1,0 +1,5 @@
+# Corporate CA certs exported by scripts/setup-corporate-ca.sh - machine-specific.
+certs/
+operations-manager/certs/
+sample-mcp-servers/certs/
+ui/certs/
