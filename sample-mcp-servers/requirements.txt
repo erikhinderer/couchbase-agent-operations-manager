@@ -1,0 +1,3 @@
+# Pin only the top-level package; let pip resolve compatible
+# starlette/uvicorn/etc. that `mcp` itself depends on.
+mcp==1.27.0

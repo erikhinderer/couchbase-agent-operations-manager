@@ -1,0 +1,134 @@
+/** Small dependency-free SVG charts, styled to match the appliance's theme. */
+
+export function BarChart({
+  data,
+  labelKey = "label",
+  valueKey = "value",
+  color = "#2dd4c8",
+  height = 220,
+}: {
+  data: Array<Record<string, any>>;
+  labelKey?: string;
+  valueKey?: string;
+  color?: string;
+  height?: number;
+}) {
+  const max = Math.max(1, ...data.map((d) => Number(d[valueKey]) || 0));
+  const barWidth = 100 / data.length;
+
+  return (
+    <div style={{ width: "100%" }}>
+      <svg viewBox={`0 0 100 ${height}`} preserveAspectRatio="none" style={{ width: "100%", height: height - 24, display: "block" }}>
+        {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+          <line
+            key={f}
+            x1={0}
+            x2={100}
+            y1={(height - 24) * (1 - f)}
+            y2={(height - 24) * (1 - f)}
+            stroke="var(--border-soft)"
+            strokeWidth={0.3}
+          />
+        ))}
+        {data.map((d, i) => {
+          const v = Number(d[valueKey]) || 0;
+          const barH = max > 0 ? (v / max) * (height - 30) : 0;
+          const x = i * barWidth + barWidth * 0.18;
+          const w = barWidth * 0.64;
+          return (
+            <rect
+              key={i}
+              x={x}
+              y={height - 24 - barH}
+              width={w}
+              height={barH}
+              rx={1.2}
+              fill={color}
+              opacity={v === 0 ? 0.15 : 0.9}
+            />
+          );
+        })}
+      </svg>
+      <div style={{ display: "flex", marginTop: 6 }}>
+        {data.map((d, i) => (
+          <div
+            key={i}
+            style={{
+              width: `${barWidth}%`,
+              textAlign: "center",
+              fontSize: 10.5,
+              color: "var(--text-faint)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {d[labelKey]}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function DonutChart({
+  segments,
+  size = 168,
+}: {
+  segments: Array<{ label: string; value: number; color: string }>;
+  size?: number;
+}) {
+  const total = segments.reduce((a, s) => a + s.value, 0);
+  const radius = 42;
+  const stroke = 15;
+  const circumference = 2 * Math.PI * radius;
+  let offsetAcc = 0;
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 22 }}>
+      <svg width={size} height={size} viewBox="0 0 100 100">
+        <circle cx={50} cy={50} r={radius} fill="none" stroke="var(--border-soft)" strokeWidth={stroke} />
+        {total > 0 &&
+          segments
+            .filter((s) => s.value > 0)
+            .map((s, i) => {
+              const frac = s.value / total;
+              const dash = frac * circumference;
+              const gap = circumference - dash;
+              const rotation = (offsetAcc / total) * 360 - 90;
+              offsetAcc += s.value;
+              return (
+                <circle
+                  key={i}
+                  cx={50}
+                  cy={50}
+                  r={radius}
+                  fill="none"
+                  stroke={s.color}
+                  strokeWidth={stroke}
+                  strokeDasharray={`${dash} ${gap}`}
+                  strokeLinecap="butt"
+                  transform={`rotate(${rotation} 50 50)`}
+                  opacity={0.92}
+                />
+              );
+            })}
+        <text x="50" y="47" textAnchor="middle" fontSize="15" fontWeight={700} fill="var(--text)">
+          {total}
+        </text>
+        <text x="50" y="60" textAnchor="middle" fontSize="7" fill="var(--text-faint)">
+          total
+        </text>
+      </svg>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {segments.map((s, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}>
+            <span style={{ width: 9, height: 9, borderRadius: 2, background: s.color, display: "inline-block" }} />
+            <span style={{ color: "var(--text-muted)" }}>{s.label}</span>
+            <span style={{ marginLeft: "auto", fontWeight: 700 }}>{s.value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
