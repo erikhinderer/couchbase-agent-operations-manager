@@ -22,6 +22,7 @@ COUCHBASE_CONFIG = {
     "llm_cache_log_collection": "llm_cache_log",
     "settings_collection": "settings",
     "agent_memory_collection": "agent_memory",
+    "users_collection": "users",
     "tools_index": os.getenv("COUCHBASE_TOOLS_INDEX", "tools_rbac_vector_index"),
     "llm_cache_index": os.getenv("COUCHBASE_LLM_CACHE_INDEX", "llm_cache_vector_index"),
     "agent_memory_index": os.getenv("COUCHBASE_AGENT_MEMORY_INDEX", "agent_memory_vector_index"),
@@ -109,3 +110,31 @@ LLM_CACHE_LOG_RETENTION_HOURS = int(os.getenv("LLM_CACHE_LOG_RETENTION_HOURS", s
 
 # How many recent cache events the savings dashboard aggregates over.
 LLM_CACHE_LOOKBACK_ENTRIES = int(os.getenv("LLM_CACHE_LOOKBACK_ENTRIES", "2000"))
+
+
+# ---------------------------------------------------------------------------
+# Local dashboard login (human users of the Settings/Servers/Roles UI - not
+# to be confused with the agent identities above, which authenticate with a
+# bearer API key and never see a login page).
+# ---------------------------------------------------------------------------
+# Signs session tokens (see app/user_auth.py) and, via a derived key, encrypts
+# secrets stored at rest in Couchbase (currently just the LDAP bind
+# password). Docker Compose generates a random one into .env on first
+# `start.sh` run - see that script. Set your own for a non-Docker deploy;
+# changing it invalidates every existing session and re-encrypts nothing
+# already stored, so rotate LDAP bind creds afterward if you change it in
+# production.
+AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "dev-only-insecure-secret-change-me")
+
+# How long a browser session stays signed in before the login page reappears.
+AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "12"))
+
+# The built-in local account every fresh install boots with. It has no
+# password until the first person to reach the login page sets one (see
+# POST /v1/auth/bootstrap) - there is no factory-default password to leave
+# unchanged.
+DEFAULT_ADMIN_USERNAME = os.getenv("DEFAULT_ADMIN_USERNAME", "admin")
+
+# Couchbase settings-collection doc id for the LDAP configuration (same
+# settings::<name> convention as settings::llm_cache) - see app/user_auth.py.
+LDAP_SETTINGS_DOC = "settings::ldap"

@@ -24,6 +24,20 @@ if [ ! -f .env ]; then
   echo "No .env found - copying .env.example to .env with default values."
   cp .env.example .env
   echo
+
+  # AUTH_SECRET_KEY signs dashboard login sessions and encrypts the LDAP
+  # bind password at rest (see operations-manager/config.py) - a fresh
+  # install should never run on config.py's hardcoded dev-only fallback.
+  GENERATED_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32 2>/dev/null || true)
+  if [ -n "$GENERATED_SECRET" ]; then
+    if grep -q "^AUTH_SECRET_KEY=" .env; then
+      sed -i.bak "s|^AUTH_SECRET_KEY=.*|AUTH_SECRET_KEY=${GENERATED_SECRET}|" .env && rm -f .env.bak
+    else
+      echo "AUTH_SECRET_KEY=${GENERATED_SECRET}" >> .env
+    fi
+    echo "Generated a random AUTH_SECRET_KEY for local login sessions."
+    echo
+  fi
 fi
 
 docker compose up --build
