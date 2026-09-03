@@ -21,8 +21,10 @@ COUCHBASE_CONFIG = {
     "llm_cache_collection": "llm_cache",
     "llm_cache_log_collection": "llm_cache_log",
     "settings_collection": "settings",
+    "agent_memory_collection": "agent_memory",
     "tools_index": os.getenv("COUCHBASE_TOOLS_INDEX", "tools_rbac_vector_index"),
     "llm_cache_index": os.getenv("COUCHBASE_LLM_CACHE_INDEX", "llm_cache_vector_index"),
+    "agent_memory_index": os.getenv("COUCHBASE_AGENT_MEMORY_INDEX", "agent_memory_vector_index"),
     "search_host": os.getenv("COUCHBASE_SEARCH_HOST", "localhost"),
     "search_port": int(os.getenv("COUCHBASE_SEARCH_PORT", "8094")),
 }

@@ -55,6 +55,7 @@ class CouchbaseStore:
         self.llm_cache = None
         self.llm_cache_log = None
         self.settings = None
+        self.agent_memory = None
         self.connected = False
 
     async def connect(self, retries: int = 30, delay_seconds: float = 5.0):
@@ -65,6 +66,7 @@ class CouchbaseStore:
                 logger.info("Connected to Couchbase on attempt %d", attempt)
                 await self.ensure_search_index()
                 await self.ensure_llm_cache_index()
+                await self.ensure_agent_memory_index()
                 return
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Couchbase connect attempt %d/%d failed: %s", attempt, retries, exc)
@@ -89,6 +91,7 @@ class CouchbaseStore:
         llm_cache = scope.collection(COUCHBASE_CONFIG["llm_cache_collection"])
         llm_cache_log = scope.collection(COUCHBASE_CONFIG["llm_cache_log_collection"])
         settings = scope.collection(COUCHBASE_CONFIG["settings_collection"])
+        agent_memory = scope.collection(COUCHBASE_CONFIG["agent_memory_collection"])
 
         # Building the four collection handles above is a purely local
         # object in the Couchbase Python SDK - it does NOT confirm the
@@ -102,7 +105,7 @@ class CouchbaseStore:
         # on startup - would crash with ScopeNotFoundException/
         # CollectionNotFoundException instead of being retried by the
         # backoff loop in connect().
-        for collection in (servers, tools, identities, access_log, llm_cache, llm_cache_log, settings):
+        for collection in (servers, tools, identities, access_log, llm_cache, llm_cache_log, settings, agent_memory):
             collection.exists("__startup_probe__")
 
         self.cluster = cluster
@@ -115,6 +118,7 @@ class CouchbaseStore:
         self.llm_cache = llm_cache
         self.llm_cache_log = llm_cache_log
         self.settings = settings
+        self.agent_memory = agent_memory
 
     # -- Search (FTS) vector index -----------------------------------------
 
@@ -567,6 +571,86 @@ class CouchbaseStore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("LLM cache index setup failed (semantic lookups will fall back to exact): %s", exc)
 
+    # -- Agent memory vector index -------------------------------------------
+
+    def _agent_memory_index_definition(self) -> dict:
+        bucket = COUCHBASE_CONFIG["bucket"]
+        scope = COUCHBASE_CONFIG["scope"]
+        collection = COUCHBASE_CONFIG["agent_memory_collection"]
+        type_key = f"{scope}.{collection}"
+
+        def keyword_field(name: str) -> dict:
+            # Identifiers (user_id, session_id, memory_type), not prose -
+            # `keyword` so a pre-filter term match is exact, not tokenized.
+            return {
+                "dynamic": False,
+                "enabled": True,
+                "fields": [{"name": name, "type": "text", "analyzer": "keyword", "index": True, "store": True}],
+            }
+
+        properties = {
+            "user_id": keyword_field("user_id"),
+            "session_id": keyword_field("session_id"),
+            "memory_type": keyword_field("memory_type"),
+            "embedding": {
+                "dynamic": False,
+                "enabled": True,
+                "fields": [{
+                    "name": "embedding",
+                    "type": "vector",
+                    "dims": EMBEDDING_CONFIG["vector_dim"],
+                    "similarity": "dot_product",
+                    "index": True,
+                    "store": True,
+                }],
+            },
+        }
+
+        return {
+            "type": "fulltext-index",
+            "name": f"{bucket}.{scope}.{COUCHBASE_CONFIG['agent_memory_index']}",
+            "sourceType": "gocbcore",
+            "sourceName": bucket,
+            "planParams": {"maxPartitionsPerPIndex": 512, "indexPartitions": 1},
+            "params": {
+                "doc_config": {"mode": "scope.collection.type_field", "type_field": "doc_type"},
+                "mapping": {
+                    "default_analyzer": "keyword",
+                    "default_datetime_parser": "dateTimeOptional",
+                    "default_field": "_all",
+                    "default_mapping": {"dynamic": False, "enabled": False},
+                    "default_type": "_default",
+                    "docvalues_dynamic": False,
+                    "index_dynamic": False,
+                    "store_dynamic": False,
+                    "type_field": "_type",
+                    "types": {type_key: {"dynamic": False, "enabled": True, "properties": properties}},
+                },
+            },
+            "store": {"indexType": "scorch", "segmentVersion": 16},
+            "sourceParams": {},
+        }
+
+    async def ensure_agent_memory_index(self):
+        def _upsert():
+            auth = (COUCHBASE_CONFIG["username"], COUCHBASE_CONFIG["password"])
+            index_name = COUCHBASE_CONFIG["agent_memory_index"]
+            url = self._search_admin_url(index_name)
+            existing = requests.get(url, auth=auth, timeout=10)
+            if existing.status_code == 200:
+                logger.info("Agent memory search index '%s' already exists", index_name)
+                return
+            resp = requests.put(url, auth=auth, json=self._agent_memory_index_definition(), timeout=15)
+            if resp.status_code in (200, 201):
+                logger.info("Agent memory search index '%s' created", index_name)
+            else:
+                logger.warning("Agent memory index creation returned %s: %s", resp.status_code, resp.text[:300])
+
+        try:
+            await asyncio.to_thread(_upsert)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Agent memory index setup failed (semantic recall will be unavailable until it exists): %s", exc)
+
     async def get_cache_entry(self, entry_id: str) -> dict | None:
         def _get():
             try:
@@ -765,3 +849,191 @@ class CouchbaseStore:
             await asyncio.to_thread(self.settings.upsert, doc_id, doc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("upsert_setting(%s) failed: %s", doc_id, exc)
+
+    # -- Agent memory ------------------------------------------------------
+    #
+    # Durable, cross-session recall for agents - the counterpart to the tool
+    # catalog's RBAC + vector search, scoped by user_id (and optionally
+    # session_id/memory_type) instead of by role. See app/agent_memory.py
+    # for what a memory document looks like and how it's validated before
+    # it ever reaches here.
+
+    async def upsert_memory(self, memory_id: str, doc: dict, ttl_seconds: int = 0):
+        def _upsert():
+            if ttl_seconds and ttl_seconds > 0:
+                self.agent_memory.upsert(memory_id, doc, UpsertOptions(expiry=timedelta(seconds=ttl_seconds)))
+            else:
+                self.agent_memory.upsert(memory_id, doc)
+
+        try:
+            await asyncio.to_thread(_upsert)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("upsert_memory(%s) failed: %s", memory_id, exc)
+            raise
+
+    async def get_memory(self, memory_id: str) -> dict | None:
+        def _get():
+            try:
+                return self.agent_memory.get(memory_id).content_as[dict]
+            except DocumentNotFoundException:
+                return None
+
+        try:
+            return await asyncio.to_thread(_get)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("get_memory(%s) failed: %s", memory_id, exc)
+            return None
+
+    async def delete_memory(self, memory_id: str) -> bool:
+        def _delete():
+            try:
+                self.agent_memory.remove(memory_id)
+                return True
+            except DocumentNotFoundException:
+                return False
+
+        try:
+            return await asyncio.to_thread(_delete)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("delete_memory(%s) failed: %s", memory_id, exc)
+            return False
+
+    async def list_memory(
+        self, user_id: str, session_id: str | None = None, memory_type: str | None = None, limit: int = 100
+    ) -> list[dict]:
+        """Chronological listing (no `embedding` - 384 floats/entry has no
+        reason to leave the cluster for a listing view), newest first."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["agent_memory_collection"]
+        clauses, params = ["m.user_id = $user_id"], {"user_id": user_id, "limit": min(limit, 500)}
+        if session_id:
+            clauses.append("m.session_id = $session_id")
+            params["session_id"] = session_id
+        if memory_type:
+            clauses.append("m.memory_type = $memory_type")
+            params["memory_type"] = memory_type
+        where = " AND ".join(clauses)
+
+        def _run():
+            q = (
+                f"SELECT META(m).id AS memory_id, m.user_id, m.session_id, m.memory_type, m.content, "
+                f"m.metadata, m.created_at, m.updated_at "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` m "
+                f"WHERE {where} ORDER BY m.created_at DESC LIMIT $limit"
+            )
+            return list(self.cluster.query(q, QueryOptions(named_parameters=params, metrics=False)).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_memory query failed: %s", exc)
+            return []
+
+    async def count_memory_entries(self) -> int:
+        return await self._count(COUCHBASE_CONFIG["agent_memory_collection"])
+
+    async def clear_memory(self, user_id: str, session_id: str | None = None) -> int:
+        """Bulk-delete everything for a user, or narrowed to one session -
+        e.g. an agent wiping short-term conversational memory at the end of
+        a session while leaving that user's durable profile memories alone."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["agent_memory_collection"]
+        clauses, params = ["m.user_id = $user_id"], {"user_id": user_id}
+        if session_id:
+            clauses.append("m.session_id = $session_id")
+            params["session_id"] = session_id
+        where = " AND ".join(clauses)
+
+        def _run():
+            q = f"DELETE FROM `{bucket}`.`{scope}`.`{coll}` m WHERE {where} RETURNING META(m).id"
+            rows = list(self.cluster.query(q, QueryOptions(named_parameters=params, metrics=False)).rows())
+            return len(rows)
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("clear_memory failed: %s", exc)
+            return 0
+
+    def _run_memory_search_sync(
+        self, user_id: str, session_id: str | None, memory_type: str | None, vector: list, top_k: int
+    ) -> list[dict]:
+        index_name = COUCHBASE_CONFIG["agent_memory_index"]
+        vector_query = CBVectorQuery.create("embedding", vector, num_candidates=max(top_k * 4, 25))
+        vector_search = CBVectorSearch.from_vector_query(vector_query)
+
+        # user_id always scopes the search - one user's memory is never
+        # returned for another's recall, however similar the prompt.
+        # session_id/memory_type narrow it further only when the caller asks.
+        must = [cb_search.TermQuery(user_id, field="user_id")]
+        if session_id:
+            must.append(cb_search.TermQuery(session_id, field="session_id"))
+        if memory_type:
+            must.append(cb_search.TermQuery(memory_type, field="memory_type"))
+        prefilter = cb_search.ConjunctionQuery(*must)
+
+        request = cb_search.SearchRequest.create(prefilter).with_vector_search(vector_search)
+        result = self.scope.search(
+            index_name,
+            request,
+            SearchOptions(limit=top_k, fields=["user_id", "session_id", "memory_type", "embedding"]),
+        )
+        return [{"id": row.id, "fields": row.fields or {}} for row in result.rows()]
+
+    async def search_memory(
+        self,
+        user_id: str,
+        query_vector: list,
+        session_id: str | None = None,
+        memory_type: str | None = None,
+        top_k: int = 5,
+    ) -> list[dict]:
+        """Semantic recall: vector similarity over the memory embedding,
+        scoped to this user (and optionally session/type). Falls back to
+        the most recent entries (still scoped the same way) if the Search
+        index isn't ready yet, so recall degrades to "recency" rather than
+        failing outright."""
+        try:
+            rows = await asyncio.to_thread(
+                self._run_memory_search_sync, user_id, session_id, memory_type, query_vector, top_k
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Semantic memory search failed (%s) - falling back to recency", exc)
+            recent = await self.list_memory(user_id, session_id=session_id, memory_type=memory_type, limit=top_k)
+            return [{**r, "similarity": None} for r in recent]
+
+        if not rows:
+            return []
+
+        query_np = np.array(query_vector, dtype=np.float32)
+        memory_ids = []
+        similarity_by_id = {}
+        for row in rows:
+            stored = row["fields"].get("embedding")
+            if not stored:
+                continue
+            similarity_by_id[row["id"]] = round(float(np.dot(query_np, np.array(stored, dtype=np.float32))), 4)
+            memory_ids.append(row["id"])
+        if not memory_ids:
+            return []
+
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["agent_memory_collection"]
+
+        def _fetch():
+            q = (
+                f"SELECT META(m).id AS memory_id, m.user_id, m.session_id, m.memory_type, m.content, "
+                f"m.metadata, m.created_at, m.updated_at "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` m WHERE META(m).id IN $ids"
+            )
+            return list(self.cluster.query(q, QueryOptions(named_parameters={"ids": memory_ids}, metrics=False)).rows())
+
+        try:
+            docs = await asyncio.to_thread(_fetch)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Fetching matched memory documents failed: %s", exc)
+            return []
+
+        out = [{**doc, "similarity": similarity_by_id.get(doc["memory_id"])} for doc in docs]
+        out.sort(key=lambda m: m["similarity"] or 0.0, reverse=True)
+        return out

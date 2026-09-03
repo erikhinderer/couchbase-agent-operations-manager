@@ -216,6 +216,11 @@ Couchbase and embedding-model-cache volumes).
   pre-filter returns. Try `shadow-diagnostics::run_diagnostic` as a tool
   ID in the Invoke panel - it's intentionally never registered, so it's
   denied no matter which role you use.
+- **Tools -> Developer SDK** - install guide and quickstart for the official
+  Python client (`aom_sdk`) - discover/invoke, cached completions, agent
+  memory, and MCP tool integration - plus download buttons for the SDK
+  itself and for AI-assistant integration skills (Claude/ChatGPT/Gemini).
+  See [Developer SDK](#developer-sdk) below.
 
 ## MCP Tool Hijacking detection
 
@@ -367,6 +372,74 @@ can be overridden per request; `bypass_cache: true` forces a live call.
 | `POST /v1/llm/cache/purge` | Manual invalidation, optionally filtered. |
 | `POST /v1/llm/cache/sweep` | Run the invalidation sweeper now. |
 | `DELETE /v1/llm/cache/{entry_id}` | Invalidate one entry. |
+
+## Developer SDK
+
+A typed Python client (`aom_sdk`) for the discover / invoke / complete /
+memory gateway ships with this appliance, so integrating an agent doesn't
+mean hand-rolling bearer headers and JSON payloads against the raw REST
+API. Get it from **Tools -> Developer SDK** in the dashboard - the page
+has the full install guide, a quickstart, and a Download SDK button - or
+from `operations-manager/sdk/` directly in this repo. The download is
+built fresh from that source on every request (`GET /v1/sdk/download`),
+so it always matches the API this appliance is actually running.
+
+```python
+from aom_sdk import AOMClient
+
+client = AOMClient("http://localhost:8090", api_key="demo-support-agent-9f21")
+
+discovered = client.discover("look up a customer's open support tickets")
+result = client.invoke(discovered["tools"][0]["tool_id"], arguments={})
+
+answer = client.complete("Summarize this ticket thread in two sentences.")
+print(answer["response"], answer["cache"]["status"])
+
+client.add_memory("user-42", "Prefers responses in metric units.", memory_type="profile")
+relevant = client.search_memory("user-42", "does this user use metric or imperial?")
+```
+
+Non-2xx responses raise typed exceptions (`AOMAuthenticationError`,
+`AOMAuthorizationError`, `AOMNotFoundError`, `AOMServerError`,
+`AOMConnectionError`) instead of a bare HTTP status code. See
+`operations-manager/sdk/README.md` and the bundled `examples/` for the
+rest, including a worked example of the LLM-caching cost/latency savings
+described above at agent-fleet scale.
+
+### Agent memory
+
+Durable, cross-session recall stored in the same Couchbase cluster as
+everything else in this appliance (`agent_memory` collection + its own
+Search vector index) - not a separate service to run. `POST /v1/memory`
+embeds and stores an entry scoped to a `user_id` (and optionally a
+`session_id`/`memory_type`); `POST /v1/memory/search` recalls the entries
+closest in meaning to a new query, the same RBAC-free vector-search
+pattern `discover_tools()` runs over the tool catalog. `GET /v1/memory`,
+`DELETE /v1/memory/{memory_id}` and `POST /v1/memory/clear` round out the
+surface. All four authenticate exactly like discover/invoke/complete.
+
+### MCP tool integration
+
+AOM already speaks MCP to every downstream tool server it proxies to (see
+`operations-manager/app/mcp_client.py`); the SDK makes that protocol
+visible on the client side too: `client.discover_mcp_tools(query)` returns
+matched tools already converted to standard MCP tool definitions
+(`{"name", "description", "inputSchema"}`), and the optional
+`aom_sdk.mcp_server` bridge (`pip install "couchbase-aom-sdk[mcp]"`) runs
+this appliance as a real local MCP server over stdio, so any MCP host can
+attach to it directly - still governed by AOM's RBAC and audit trail.
+
+### AI assistant integration skills
+
+The same integration knowledge as the guide above, packaged so a coding
+assistant can apply it to a codebase directly: a real Claude Skill
+(`operations-manager/skills/claude/SKILL.md`), plus equivalent packages for
+ChatGPT and Gemini (`operations-manager/skills/{chatgpt,gemini}/`) - those
+two platforms have no single portable skill-file format, so they ship as
+plain instructions text with a README on where to paste it (Custom GPT
+instructions, an Assistants/Responses system message, an `AGENTS.md` file,
+a `GEMINI.md` context file, or a Gem's instructions). All three download
+from **Tools -> Developer SDK**, or `GET /v1/skills/{claude,chatgpt,gemini}/download`.
 
 ## Registering your own MCP servers
 

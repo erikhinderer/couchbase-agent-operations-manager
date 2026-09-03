@@ -24,11 +24,11 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app import hijack_detection, insights, llm_cache, mcp_client
+from app import agent_memory, hijack_detection, insights, llm_cache, mcp_client, sdk_packaging, skill_packaging
 from app.catalog_ingest import ingest_all, ingest_server, rescan_all_tools, seed_servers
 from app.couchbase_client import CouchbaseStore
 from app.embeddings import ToolEmbeddings
@@ -279,6 +279,76 @@ async def health():
 @app.get("/v1/roles")
 async def roles():
     return {"roles": [{"id": rid, "description": desc} for rid, desc in ROLES.items()]}
+
+
+# ---------------------------------------------------------------------------
+# Developer SDK distribution (see Tools -> Developer SDK in the dashboard)
+# ---------------------------------------------------------------------------
+@app.get("/v1/sdk/info")
+async def sdk_info():
+    """Metadata for the Developer SDK download button - version, filename
+    and size - without shipping the archive bytes themselves."""
+    if not sdk_packaging.sdk_available():
+        raise HTTPException(status_code=404, detail="Developer SDK is not bundled in this image")
+    archive = sdk_packaging.build_sdk_archive()
+    return {
+        "version": sdk_packaging.sdk_version(),
+        "filename": sdk_packaging.sdk_filename(),
+        "size_bytes": len(archive),
+    }
+
+
+@app.get("/v1/sdk/download")
+async def sdk_download():
+    """Zips operations-manager/sdk/ on demand and serves it as an
+    attachment, so the download always matches the SDK source shipped in
+    this running image rather than a prebuilt artifact that can go stale."""
+    if not sdk_packaging.sdk_available():
+        raise HTTPException(status_code=404, detail="Developer SDK is not bundled in this image")
+    archive = sdk_packaging.build_sdk_archive()
+    filename = sdk_packaging.sdk_filename()
+    return Response(
+        content=archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# AI-assistant integration skills (Claude / ChatGPT / Gemini) - same
+# integration knowledge as the Developer SDK guide, packaged for each
+# assistant's own way of taking custom instructions. See
+# operations-manager/skills/ and app/skill_packaging.py.
+# ---------------------------------------------------------------------------
+@app.get("/v1/skills/{platform}/info")
+async def skill_info(platform: str):
+    if platform not in skill_packaging.PLATFORMS:
+        raise HTTPException(status_code=404, detail=f"Unknown skill platform '{platform}'")
+    if not skill_packaging.skill_available(platform):
+        raise HTTPException(status_code=404, detail=f"{skill_packaging.skill_label(platform)} is not bundled in this image")
+    archive = skill_packaging.build_skill_archive(platform)
+    return {
+        "platform": platform,
+        "label": skill_packaging.skill_label(platform),
+        "version": sdk_packaging.sdk_version(),
+        "filename": skill_packaging.skill_filename(platform),
+        "size_bytes": len(archive),
+    }
+
+
+@app.get("/v1/skills/{platform}/download")
+async def skill_download(platform: str):
+    if platform not in skill_packaging.PLATFORMS:
+        raise HTTPException(status_code=404, detail=f"Unknown skill platform '{platform}'")
+    if not skill_packaging.skill_available(platform):
+        raise HTTPException(status_code=404, detail=f"{skill_packaging.skill_label(platform)} is not bundled in this image")
+    archive = skill_packaging.build_skill_archive(platform)
+    filename = skill_packaging.skill_filename(platform)
+    return Response(
+        content=archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -988,3 +1058,134 @@ async def llm_dashboard():
         "model_breakdown": data["model_breakdown"],
         "recent_events": events[:50],
     }
+
+
+# ---------------------------------------------------------------------------
+# Agent memory (see app/agent_memory.py; storage/search in couchbase_client.py)
+# ---------------------------------------------------------------------------
+class AddMemoryRequest(BaseModel):
+    user_id: str
+    content: str
+    session_id: str | None = None
+    memory_type: str = agent_memory.DEFAULT_MEMORY_TYPE
+    metadata: dict = Field(default_factory=dict)
+    ttl_seconds: int = 0
+
+
+class SearchMemoryRequest(BaseModel):
+    user_id: str
+    query: str
+    session_id: str | None = None
+    memory_type: str | None = None
+    top_k: int = 5
+
+
+class ClearMemoryRequest(BaseModel):
+    user_id: str
+    session_id: str | None = None
+
+
+@app.post("/v1/memory")
+async def add_memory(req: AddMemoryRequest, authorization: str | None = Header(default=None)):
+    """Store one memory entry for `user_id`, embedded for later semantic
+    recall via POST /v1/memory/search. Authenticated exactly like
+    discover/invoke/complete - any valid API key may write memory, scoped
+    by the `user_id` it names rather than by RBAC role."""
+    role, subject = await authenticate(authorization)
+    if not req.content or not req.content.strip():
+        raise HTTPException(status_code=400, detail="content is required")
+    if not store.connected or embeddings is None:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+
+    start = time.time()
+    memory_id = agent_memory.new_memory_id(req.user_id)
+    embedding_text = agent_memory.build_embedding_text(req.content, req.metadata)
+    embedding = embeddings.embed(embedding_text)
+    doc = agent_memory.build_memory_doc(
+        user_id=req.user_id, content=req.content, embedding=embedding,
+        session_id=req.session_id, memory_type=req.memory_type, metadata=req.metadata,
+        role=role, subject_label=subject,
+    )
+    await store.upsert_memory(memory_id, doc, ttl_seconds=req.ttl_seconds)
+    latency_ms = int((time.time() - start) * 1000)
+
+    await store.log_access(
+        action="memory_add", role=role, subject_label=subject, query=req.content[:240],
+        tool_id=None, server_id=None, decision="ALLOW",
+        reason=f"stored {doc['memory_type']} memory for user '{req.user_id}'", latency_ms=latency_ms,
+    )
+    return {"memory_id": memory_id, "user_id": req.user_id, "memory_type": doc["memory_type"], "created_at": doc["created_at"]}
+
+
+@app.get("/v1/memory")
+async def list_memory_route(
+    user_id: str, session_id: str | None = None, memory_type: str | None = None, limit: int = 100,
+    authorization: str | None = Header(default=None),
+):
+    """Chronological listing for one user (optionally narrowed to a
+    session or memory type) - what a fresh agent turn re-hydrates before
+    reasoning, or what a debugging session inspects directly."""
+    role, subject = await authenticate(authorization)
+    if not store.connected:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+    entries = await store.list_memory(user_id, session_id=session_id, memory_type=memory_type, limit=min(limit, 500))
+    await store.log_access(
+        action="memory_list", role=role, subject_label=subject, query=None, tool_id=None, server_id=None,
+        decision="ALLOW", reason=f"listed {len(entries)} memory entr(ies) for user '{user_id}'", latency_ms=0,
+    )
+    return {"user_id": user_id, "entries": entries, "count": len(entries)}
+
+
+@app.post("/v1/memory/search")
+async def search_memory_route(req: SearchMemoryRequest, authorization: str | None = Header(default=None)):
+    """Semantic recall: the memory entries for `user_id` whose content is
+    closest to `query`, not just the most recent ones - the same vector
+    kNN pattern discover() runs over the tool catalog, scoped to one user's
+    memory instead of one role's tools."""
+    role, subject = await authenticate(authorization)
+    if not req.query or not req.query.strip():
+        raise HTTPException(status_code=400, detail="query is required")
+    if not store.connected or embeddings is None:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+
+    start = time.time()
+    vector = embeddings.embed(req.query)
+    memory_type = agent_memory.normalize_memory_type(req.memory_type) if req.memory_type else None
+    results = await store.search_memory(
+        req.user_id, vector, session_id=req.session_id, memory_type=memory_type, top_k=req.top_k,
+    )
+    latency_ms = int((time.time() - start) * 1000)
+
+    await store.log_access(
+        action="memory_search", role=role, subject_label=subject, query=req.query, tool_id=None, server_id=None,
+        decision="ALLOW", reason=f"{len(results)} memory match(es) for user '{req.user_id}'", latency_ms=latency_ms,
+    )
+    return {"user_id": req.user_id, "entries": results, "latency_ms": latency_ms}
+
+
+@app.delete("/v1/memory/{memory_id:path}")
+async def delete_memory_route(memory_id: str, authorization: str | None = Header(default=None)):
+    role, subject = await authenticate(authorization)
+    deleted = await store.delete_memory(memory_id)
+    await store.log_access(
+        action="memory_delete", role=role, subject_label=subject, query=None, tool_id=None, server_id=None,
+        decision="ALLOW" if deleted else "ERROR",
+        reason="deleted" if deleted else "memory entry not found", latency_ms=0,
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Memory entry not found")
+    return {"deleted": True, "memory_id": memory_id}
+
+
+@app.post("/v1/memory/clear")
+async def clear_memory_route(req: ClearMemoryRequest, authorization: str | None = Header(default=None)):
+    """Bulk-wipe a user's memory, or just one session of it - e.g. an agent
+    clearing short-term conversational memory at session end while leaving
+    that user's durable profile memories untouched."""
+    role, subject = await authenticate(authorization)
+    removed = await store.clear_memory(req.user_id, session_id=req.session_id)
+    await store.log_access(
+        action="memory_clear", role=role, subject_label=subject, query=None, tool_id=None, server_id=None,
+        decision="ALLOW", reason=f"cleared {removed} memory entr(ies) for user '{req.user_id}'", latency_ms=0,
+    )
+    return {"user_id": req.user_id, "cleared": removed}

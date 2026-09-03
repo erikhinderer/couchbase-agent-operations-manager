@@ -10,7 +10,9 @@ import type {
   LLMDashboardResponse,
   LLMProvider,
   Role,
+  SdkInfo,
   ServerDoc,
+  SkillInfo,
   ThreatDetectionResponse,
   ToolDoc,
 } from "./types";
@@ -46,6 +48,9 @@ export const api = {
   health: () => request<HealthResponse>("/api/health"),
 
   roles: () => request<{ roles: Role[] }>("/v1/roles"),
+
+  sdkInfo: () => request<SdkInfo>("/v1/sdk/info"),
+  skillInfo: (platform: string) => request<SkillInfo>(`/v1/skills/${platform}/info`),
 
   servers: () => request<{ servers: ServerDoc[] }>("/v1/servers"),
   registerServer: (payload: {

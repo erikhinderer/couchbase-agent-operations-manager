@@ -33,6 +33,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY config.py .
 COPY app ./app
+COPY sdk ./sdk
+COPY skills ./skills
 
 ENV TOKENIZERS_PARALLELISM=false
 

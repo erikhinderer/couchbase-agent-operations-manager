@@ -3,6 +3,20 @@ export interface Role {
   description: string;
 }
 
+export interface SdkInfo {
+  version: string;
+  filename: string;
+  size_bytes: number;
+}
+
+export interface SkillInfo {
+  platform: string;
+  label: string;
+  version: string;
+  filename: string;
+  size_bytes: number;
+}
+
 export interface ServerDoc {
   server_id: string;
   label: string;

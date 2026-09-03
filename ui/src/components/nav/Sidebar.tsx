@@ -38,7 +38,10 @@ const NAV_SECTIONS: Array<{
   },
   {
     label: "Tools",
-    items: [{ to: "/agent-tool-audit", icon: "▸", text: "Agent Tool Audit" }],
+    items: [
+      { to: "/agent-tool-audit", icon: "▸", text: "Agent Tool Audit" },
+      { to: "/developer-sdk", icon: "⤓", text: "Developer SDK" },
+    ],
   },
 ];
 

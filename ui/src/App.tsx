@@ -10,6 +10,7 @@ import { ThreatDetectionPage } from "./pages/ThreatDetectionPage";
 import { InsightsPage } from "./pages/InsightsPage";
 import { AuditLogPage } from "./pages/AuditLogPage";
 import { AgentToolAuditPage } from "./pages/AgentToolAuditPage";
+import { DeveloperSdkPage } from "./pages/DeveloperSdkPage";
 
 export default function App() {
   return (
@@ -27,6 +28,7 @@ export default function App() {
           <Route path="/insights" element={<InsightsPage />} />
           <Route path="/audit-log" element={<AuditLogPage />} />
           <Route path="/agent-tool-audit" element={<AgentToolAuditPage />} />
+          <Route path="/developer-sdk" element={<DeveloperSdkPage />} />
         </Routes>
       </main>
     </div>

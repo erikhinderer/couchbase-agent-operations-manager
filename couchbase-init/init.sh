@@ -80,7 +80,11 @@ curl -s -u "${CB_USER}:${CB_PASS}" -X POST \
 #             savings dashboard is computed from
 # settings  - user-editable runtime policy documents (currently
 #             settings::llm_cache, written from the LLM Caching page)
-for COLLECTION in servers tools identities access_log llm_cache llm_cache_log settings; do
+# agent_memory - durable, cross-session agent memory: content + embedding,
+#             scoped by user_id/session_id/memory_type (see
+#             operations-manager/app/agent_memory.py and the Developer SDK's
+#             AOMClient.add_memory/search_memory)
+for COLLECTION in servers tools identities access_log llm_cache llm_cache_log settings agent_memory; do
   echo "[couchbase-init] Creating collection '${CB_SCOPE}.${COLLECTION}'..."
   curl -s -u "${CB_USER}:${CB_PASS}" -X POST \
     http://${CB_HOST}:8091/pools/default/buckets/${CB_BUCKET}/scopes/${CB_SCOPE}/collections \
@@ -91,7 +95,7 @@ echo "[couchbase-init] Waiting for collections to propagate to the Query service
 sleep 8
 
 echo "[couchbase-init] Creating primary indexes for N1QL support..."
-for COLLECTION in servers tools identities access_log llm_cache llm_cache_log settings; do
+for COLLECTION in servers tools identities access_log llm_cache llm_cache_log settings agent_memory; do
   curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
     -d "statement=CREATE PRIMARY INDEX IF NOT EXISTS ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`${COLLECTION}\`" > /dev/null || true
 done
