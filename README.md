@@ -157,17 +157,68 @@ or, for a clearer view of the multi-container startup sequence:
 First boot downloads the Couchbase Enterprise image and a local embedding
 model (~100MB, cached afterwards) - give it a few minutes. Then open:
 
-- **Dashboard**: <http://localhost:5173>
-- **Operations Manager API**: <http://localhost:8090> (see `/docs` for the
+- **Dashboard**: <https://localhost:5173> (log in as `admin` - you'll be
+  asked to set that account's password the first time)
+- **Operations Manager API**: <https://localhost:8090> (see `/docs` for the
   OpenAPI UI)
 - **Couchbase Web Console**: <http://localhost:8091> (`Administrator` /
-  `CouchbaseDemo123!` by default)
+  `CouchbaseDemo123!` by default - Couchbase Server's own console isn't
+  covered by this appliance's TLS setup)
+
+Both the dashboard and the API serve HTTPS with a self-signed certificate
+by default, so your browser will warn about it and `curl`/SDK calls need
+`-k`/`verify=False` until you install a real one - see
+[HTTPS / TLS](#https--tls) below.
 
 LLM caching is on by default and needs no API key to try - see
 [LLM caching for agents](#llm-caching-for-agents).
 
 `docker compose down -v` gives you a fully clean start (drops the
 Couchbase and embedding-model-cache volumes).
+
+## HTTPS / TLS
+
+The dashboard (nginx, port 5173→443) and the Operations Manager API
+(uvicorn, port 8090) both serve HTTPS by default, including the internal
+proxy hop nginx makes to the API. Each image bakes in a self-signed
+certificate at build time (`operations-manager/Dockerfile`,
+`ui/Dockerfile`) so a fresh checkout gets TLS with zero configuration -
+your browser will warn about the self-signed cert, and `curl`/SDK calls
+need `-k` / `verify=False` (see the [Developer SDK](#developer-sdk)
+section) until you swap in a real one.
+
+**Using your own certificate.** Drop a `server.crt`/`server.key` pair into
+`operations-manager/tls/` and `ui/tls/` (both are gitignored - never
+commit private keys) and uncomment the matching volume mount in
+`docker-compose.yml`:
+
+```yaml
+# operations-manager service
+volumes:
+  - ./operations-manager/tls:/app/tls:ro
+
+# ui service
+volumes:
+  - ./ui/tls:/etc/nginx/tls:ro
+```
+
+Restart with `docker compose up --build` and both containers pick up the
+mounted cert instead of the baked-in one - no other configuration changes.
+
+**Disabling TLS.** If you need plain HTTP (e.g. running behind a load
+balancer that already terminates TLS), set `DISABLE_TLS=true` for
+`operations-manager` and `OPERATIONS_MANAGER_SCHEME=http` for `ui` in your
+`.env`, so nginx's proxy hop matches the API's actual scheme. The two
+settings must agree, or nginx will fail to reach the API.
+
+**Corporate CA for LDAP.** This is unrelated to the two settings above.
+If you connect Settings → LDAP Authentication to a directory whose LDAPS
+certificate (or StartTLS cert) is signed by an internal corporate CA, use
+the "Install corporate CA certificate" option on that page to upload the
+CA's PEM so the appliance can validate the LDAP server's certificate. This
+is also unrelated to `scripts/setup-corporate-ca.sh`, which is a
+build-time-only helper for trusting a TLS-inspecting proxy CA during
+`docker compose build` (see the note under [Run it](#run-it)).
 
 ## Using the dashboard
 
@@ -347,7 +398,7 @@ reports what it just invalidated.
 ### Calling it
 
 ```bash
-curl -X POST http://localhost:8090/v1/llm/complete \
+curl -k -X POST https://localhost:8090/v1/llm/complete \
   -H "Authorization: Bearer demo-admin-4c56" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Summarise the RBAC model in three sentences."}'
@@ -384,7 +435,7 @@ so it always matches the API this appliance is actually running.
 ```python
 from aom_sdk import AOMClient
 
-client = AOMClient("http://localhost:8090", api_key="demo-support-agent-9f21")
+client = AOMClient("https://localhost:8090", api_key="demo-support-agent-9f21", verify=False)
 
 discovered = client.discover("look up a customer's open support tickets")
 result = client.invoke(discovered["tools"][0]["tool_id"], arguments={})
@@ -446,8 +497,12 @@ if it's marked `trusted` - leave a newly-added server `untrusted` until
 you've reviewed it, then flip it to trusted and hit Re-ingest.
 
 ```bash
-curl -X POST http://localhost:8090/v1/servers \
+# /v1/servers is part of the dashboard's admin surface, so this needs a
+# logged-in session cookie (log in via /v1/auth/login and pass its
+# Set-Cookie back with -b) - the payload shape below is what matters here.
+curl -k -X POST https://localhost:8090/v1/servers \
   -H "Content-Type: application/json" \
+  -b cookies.txt \
   -d '{
         "server_id": "billing-service",
         "label": "Billing Service (Internal)",

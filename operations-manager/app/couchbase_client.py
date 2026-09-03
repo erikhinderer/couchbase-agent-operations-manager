@@ -56,6 +56,7 @@ class CouchbaseStore:
         self.llm_cache_log = None
         self.settings = None
         self.agent_memory = None
+        self.users = None
         self.connected = False
 
     async def connect(self, retries: int = 30, delay_seconds: float = 5.0):
@@ -92,6 +93,7 @@ class CouchbaseStore:
         llm_cache_log = scope.collection(COUCHBASE_CONFIG["llm_cache_log_collection"])
         settings = scope.collection(COUCHBASE_CONFIG["settings_collection"])
         agent_memory = scope.collection(COUCHBASE_CONFIG["agent_memory_collection"])
+        users = scope.collection(COUCHBASE_CONFIG["users_collection"])
 
         # Building the four collection handles above is a purely local
         # object in the Couchbase Python SDK - it does NOT confirm the
@@ -105,7 +107,7 @@ class CouchbaseStore:
         # on startup - would crash with ScopeNotFoundException/
         # CollectionNotFoundException instead of being retried by the
         # backoff loop in connect().
-        for collection in (servers, tools, identities, access_log, llm_cache, llm_cache_log, settings, agent_memory):
+        for collection in (servers, tools, identities, access_log, llm_cache, llm_cache_log, settings, agent_memory, users):
             collection.exists("__startup_probe__")
 
         self.cluster = cluster
@@ -119,6 +121,7 @@ class CouchbaseStore:
         self.llm_cache_log = llm_cache_log
         self.settings = settings
         self.agent_memory = agent_memory
+        self.users = users
 
     # -- Search (FTS) vector index -----------------------------------------
 
@@ -1037,3 +1040,53 @@ class CouchbaseStore:
         out = [{**doc, "similarity": similarity_by_id.get(doc["memory_id"])} for doc in docs]
         out.sort(key=lambda m: m["similarity"] or 0.0, reverse=True)
         return out
+
+    # -- Local dashboard accounts (see app/user_auth.py) --------------------
+    #
+    # Human login for the dashboard UI itself - distinct from the identities
+    # collection above, which maps agent API keys to an RBAC role. Username
+    # (lowercased) is the document id, same as server_id is for `servers`.
+
+    async def upsert_user(self, username: str, doc: dict):
+        await asyncio.to_thread(self.users.upsert, username.lower(), doc)
+
+    async def get_user(self, username: str) -> dict | None:
+        def _get():
+            try:
+                return self.users.get(username.lower()).content_as[dict]
+            except DocumentNotFoundException:
+                return None
+
+        return await asyncio.to_thread(_get)
+
+    async def delete_user(self, username: str) -> bool:
+        def _delete():
+            try:
+                self.users.remove(username.lower())
+                return True
+            except DocumentNotFoundException:
+                return False
+
+        return await asyncio.to_thread(_delete)
+
+    async def list_users(self) -> list[dict]:
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["users_collection"]
+
+        def _run():
+            # password_hash never leaves Couchbase for a list call.
+            q = (
+                f"SELECT META(u).id AS username, u.role, u.source, u.active, u.must_change_password, "
+                f"u.password_hash, u.created_at, u.updated_at, u.last_login_at "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` u ORDER BY META(u).id"
+            )
+            return list(self.cluster.query(q, QueryOptions(metrics=False)).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_users query failed: %s", exc)
+            return []
+
+    async def count_users(self) -> int:
+        return await self._count(COUCHBASE_CONFIG["users_collection"])

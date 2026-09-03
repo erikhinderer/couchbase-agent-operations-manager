@@ -24,22 +24,27 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app import agent_memory, hijack_detection, insights, llm_cache, mcp_client, sdk_packaging, skill_packaging
+from app import agent_memory, hijack_detection, insights, llm_cache, mcp_client, sdk_packaging, skill_packaging, user_auth
 from app.catalog_ingest import ingest_all, ingest_server, rescan_all_tools, seed_servers
 from app.couchbase_client import CouchbaseStore
 from app.embeddings import ToolEmbeddings
 from app.rbac_policy import ROLES
 from config import (
     APPLIANCE_NAME,
+    AUTH_SECRET_KEY,
+    AUTH_SESSION_TTL_HOURS,
     COUCHBASE_CONFIG,
+    DEFAULT_ADMIN_USERNAME,
     EMBEDDING_CONFIG,
     HIJACK_CHAIN_WINDOW_SECONDS,
     HIJACK_SCAN_INTERVAL_MINUTES,
     INSIGHTS_LOOKBACK_ENTRIES,
+    LDAP_SETTINGS_DOC,
     LLM_API_KEYS,
     LLM_CACHE_DEFAULTS,
     LLM_CACHE_LOOKBACK_ENTRIES,
@@ -57,6 +62,43 @@ app = FastAPI(
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+# Paths reachable with no dashboard login session: the login/bootstrap flow
+# itself, the health probe, and every agent-facing endpoint - those already
+# authenticate their caller with a bearer API key via authenticate() above,
+# which has nothing to do with a human's browser session cookie. Everything
+# else under /v1 and /api is the dashboard's own admin surface (servers,
+# catalog, roles, audit log, threat detection, insights, LLM caching
+# policy, Settings) and requires a valid session.
+UNPROTECTED_PATH_PREFIXES = (
+    "/api/health",
+    "/v1/auth/login",
+    "/v1/auth/logout",
+    "/v1/auth/bootstrap",
+    "/v1/tools/discover",
+    "/v1/tools/invoke",
+    "/v1/llm/complete",
+    "/v1/memory",
+    "/v1/sdk/",
+    "/v1/skills/",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+)
+
+
+@app.middleware("http")
+async def require_dashboard_session(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or path.startswith(UNPROTECTED_PATH_PREFIXES):
+        return await call_next(request)
+
+    session = user_auth.decode_session_token(request.cookies.get(user_auth.SESSION_COOKIE_NAME))
+    if not session:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+    request.state.user = session
+    return await call_next(request)
+
+
 store = CouchbaseStore()
 embeddings: ToolEmbeddings | None = None
 ready = False
@@ -72,6 +114,13 @@ llm_config_version: str = llm_cache.config_fingerprint(llm_config)
 llm_catalog_version: str = ""
 last_llm_sweep_at: str | None = None
 
+# Local dashboard login (see app/user_auth.py). The LDAP policy is
+# user-editable from Settings -> LDAP Authentication and persisted in
+# Couchbase at settings::ldap, loaded into memory here the same way the LLM
+# cache policy is - a login attempt should never cost an extra Couchbase
+# round-trip just to find out whether LDAP is even enabled.
+ldap_config: dict = user_auth.normalize_ldap_config(None)
+
 
 @app.on_event("startup")
 async def startup():
@@ -79,12 +128,22 @@ async def startup():
     logger.info("Loading local embedding model...")
     embeddings = ToolEmbeddings(EMBEDDING_CONFIG["model_name"])
 
+    if AUTH_SECRET_KEY == "dev-only-insecure-secret-change-me":
+        logger.warning(
+            "AUTH_SECRET_KEY is unset - using the insecure built-in default. Dashboard login sessions and any "
+            "stored LDAP bind password are only as safe as that well-known string. Set AUTH_SECRET_KEY (start.sh "
+            "does this for you automatically) before relying on this outside local evaluation."
+        )
+
     logger.info("Connecting to Couchbase...")
     await store.connect()
 
     if store.connected:
         for api_key, role in SEED_API_KEYS.items():
             await store.upsert_identity(api_key, role, label=f"...{api_key[-4:]}")
+
+        await seed_default_admin()
+        await load_ldap_config()
 
         await seed_servers(store, SAMPLE_MCP_SERVERS_BASE_URL)
 
@@ -124,6 +183,40 @@ async def hijack_monitor_loop():
                 logger.info("Hijack monitor: %d tool(s) changed trust/hijack status on this pass", changed)
         except Exception as exc:  # noqa: BLE001
             logger.error("Hijack monitor pass failed: %s", exc)
+
+
+async def seed_default_admin():
+    """Provision the built-in `admin` account on first boot, with no
+    password set yet - see POST /v1/auth/bootstrap. Idempotent: does
+    nothing once that account already exists, so it never resets a
+    password an operator has already chosen."""
+    existing = await store.get_user(DEFAULT_ADMIN_USERNAME)
+    if existing:
+        return
+    doc = user_auth.new_local_user_doc(role="admin", password_hash=None, source="local", must_change_password=True)
+    await store.upsert_user(DEFAULT_ADMIN_USERNAME, doc)
+    logger.info("Seeded default local account '%s' - password not yet set (first login sets it).", DEFAULT_ADMIN_USERNAME)
+
+
+async def load_ldap_config():
+    global ldap_config
+    stored = await store.get_setting(LDAP_SETTINGS_DOC)
+    ldap_config = user_auth.normalize_ldap_config(stored.get("config") if stored else None)
+    logger.info("LDAP config loaded (enabled=%s host=%s)", ldap_config["enabled"], ldap_config["host"] or "-")
+
+
+async def save_ldap_config(cfg: dict):
+    global ldap_config
+    ldap_config = user_auth.normalize_ldap_config(cfg)
+    await store.upsert_setting(
+        LDAP_SETTINGS_DOC,
+        {
+            "doc_type": "settings",
+            "setting_id": "ldap",
+            "config": ldap_config,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
 
 
 async def load_llm_config():
@@ -241,6 +334,53 @@ class RegisterServerRequest(BaseModel):
     default_allowed_roles: list[str] = Field(default_factory=list)
 
 
+# -- Local dashboard login ---------------------------------------------------
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class BootstrapRequest(BaseModel):
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(..., pattern=r"^[a-zA-Z0-9._-]{2,64}$")
+    password: str
+    role: str = user_auth.DEFAULT_LOCAL_ROLE
+    must_change_password: bool = True
+
+
+class UpdateUserRequest(BaseModel):
+    role: str | None = None
+    active: bool | None = None
+    password: str | None = None
+    must_change_password: bool | None = None
+
+
+class LdapConfigRequest(BaseModel):
+    # Raw dict, same convention as LLMConfigRequest.config - validated
+    # server-side by user_auth.normalize_ldap_config, not by this shape.
+    # An included "bind_password" (plain text) sets/replaces the encrypted
+    # secret; omitting it (or sending "") leaves the stored one unchanged.
+    config: dict
+    bind_password: str | None = None
+
+
+class LdapTestRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LdapCaCertificateRequest(BaseModel):
+    ca_certificate: str
+
+
 # ---------------------------------------------------------------------------
 # Auth helper
 # ---------------------------------------------------------------------------
@@ -260,6 +400,18 @@ async def authenticate(authorization: str | None) -> tuple[str, str]:
         )
         raise HTTPException(status_code=401, detail="Invalid API key")
     return role, f"...{api_key[-4:]}"
+
+
+def require_admin(request: Request) -> dict:
+    """Dashboard-session counterpart to authenticate() above: require_dashboard_session
+    (the app middleware) already guarantees request.state.user exists on any
+    protected path, so this only adds the role check for the Settings
+    surface (local accounts, LDAP config) - the parts of Settings the
+    request explicitly scopes to admin users."""
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -1189,3 +1341,293 @@ async def clear_memory_route(req: ClearMemoryRequest, authorization: str | None 
         decision="ALLOW", reason=f"cleared {removed} memory entr(ies) for user '{req.user_id}'", latency_ms=0,
     )
     return {"user_id": req.user_id, "cleared": removed}
+
+
+# ---------------------------------------------------------------------------
+# Local dashboard login (see app/user_auth.py). Distinct from authenticate()
+# above: that resolves an agent's bearer API key to an RBAC role; everything
+# below resolves a person's username/password (local or LDAP) to a signed
+# session cookie that require_dashboard_session (the app middleware near the
+# top of this file) then requires on every other /v1 and /api route.
+# ---------------------------------------------------------------------------
+
+async def _finish_login(username: str, response: Response, request: Request):
+    doc = await store.get_user(username)
+    if not doc:
+        raise HTTPException(status_code=500, detail="Account vanished mid-login")
+    token = user_auth.create_session_token(username, doc.get("role", user_auth.DEFAULT_LOCAL_ROLE))
+    response.set_cookie(
+        key=user_auth.SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        max_age=AUTH_SESSION_TTL_HOURS * 3600,
+        path="/",
+    )
+    doc["last_login_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    await store.upsert_user(username, doc)
+    return doc
+
+
+@app.get("/v1/auth/bootstrap-status")
+async def bootstrap_status():
+    """Tells the login page which form to render: the one-time "set the
+    admin password" form (a fresh install, or one where it was never
+    completed) or the normal username/password login form."""
+    admin_doc = await store.get_user(DEFAULT_ADMIN_USERNAME)
+    needs_setup = bool(admin_doc) and not admin_doc.get("password_hash")
+    return {"needs_setup": needs_setup, "username": DEFAULT_ADMIN_USERNAME}
+
+
+@app.post("/v1/auth/bootstrap")
+async def bootstrap(req: BootstrapRequest, request: Request, response: Response):
+    """Sets the default admin account's password the first time anyone
+    reaches the login page. Refuses once a password already exists - after
+    that, POST /v1/auth/login (or a password reset from Settings) is the
+    only way in."""
+    admin_doc = await store.get_user(DEFAULT_ADMIN_USERNAME)
+    if not admin_doc:
+        raise HTTPException(status_code=503, detail="Not ready yet - try again shortly.")
+    if admin_doc.get("password_hash"):
+        raise HTTPException(status_code=409, detail="The admin password has already been set. Use the login form.")
+    policy_error = user_auth.password_policy_error(req.password)
+    if policy_error:
+        raise HTTPException(status_code=400, detail=policy_error)
+
+    admin_doc["password_hash"] = user_auth.hash_password(req.password)
+    admin_doc["must_change_password"] = False
+    admin_doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    await store.upsert_user(DEFAULT_ADMIN_USERNAME, admin_doc)
+
+    doc = await _finish_login(DEFAULT_ADMIN_USERNAME, response, request)
+    return {"user": user_auth.public_user(DEFAULT_ADMIN_USERNAME, doc)}
+
+
+@app.post("/v1/auth/login")
+async def login(req: LoginRequest, request: Request, response: Response):
+    username = req.username.strip()
+    if not username or not req.password:
+        raise HTTPException(status_code=400, detail="Username and password are required.")
+
+    user_doc = await store.get_user(username)
+
+    if user_doc and user_doc.get("source", "local") == "local":
+        if not user_doc.get("password_hash"):
+            raise HTTPException(
+                status_code=409,
+                detail="This account has no password set yet - use the setup form instead.",
+            )
+        if not user_doc.get("active", True):
+            raise HTTPException(status_code=403, detail="This account has been disabled.")
+        if not user_auth.verify_password(req.password, user_doc.get("password_hash")):
+            raise HTTPException(status_code=401, detail="Invalid username or password.")
+        doc = await _finish_login(username, response, request)
+        return {"user": user_auth.public_user(username, doc)}
+
+    # No local account by that name (or it's a previously-provisioned LDAP
+    # shadow record) - try the directory if one is configured.
+    if ldap_config.get("enabled"):
+        success, detail, is_admin = await user_auth.ldap_authenticate(ldap_config, username, req.password)
+        if not success:
+            raise HTTPException(status_code=401, detail=detail)
+        if user_doc and user_doc.get("active") is False:
+            raise HTTPException(status_code=403, detail="This account has been disabled.")
+
+        role = "admin" if is_admin else user_auth.DEFAULT_LOCAL_ROLE
+        shadow = user_auth.new_local_user_doc(role=role, password_hash=None, source="ldap")
+        if user_doc:
+            shadow["created_at"] = user_doc.get("created_at", shadow["created_at"])
+            shadow["active"] = user_doc.get("active", True)
+        await store.upsert_user(username, shadow)
+        doc = await _finish_login(username, response, request)
+        return {"user": user_auth.public_user(username, doc)}
+
+    raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+
+@app.post("/v1/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie(user_auth.SESSION_COOKIE_NAME, path="/")
+    return {"logged_out": True}
+
+
+@app.get("/v1/auth/me")
+async def auth_me(request: Request):
+    session = getattr(request.state, "user", None)
+    if not session:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    doc = await store.get_user(session["username"])
+    if not doc:
+        raise HTTPException(status_code=401, detail="Account no longer exists")
+    return {"user": user_auth.public_user(session["username"], doc)}
+
+
+@app.post("/v1/auth/change-password")
+async def change_password(req: ChangePasswordRequest, request: Request):
+    """Self-service password change - also clears must_change_password, so
+    this is what an account created with a forced reset uses to satisfy it."""
+    session = getattr(request.state, "user", None)
+    if not session:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    username = session["username"]
+    doc = await store.get_user(username)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if doc.get("source") != "local":
+        raise HTTPException(status_code=400, detail="This account authenticates via LDAP - there is no local password to change.")
+    if not user_auth.verify_password(req.current_password, doc.get("password_hash")):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+    policy_error = user_auth.password_policy_error(req.new_password)
+    if policy_error:
+        raise HTTPException(status_code=400, detail=policy_error)
+
+    doc["password_hash"] = user_auth.hash_password(req.new_password)
+    doc["must_change_password"] = False
+    doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    await store.upsert_user(username, doc)
+    return {"user": user_auth.public_user(username, doc)}
+
+
+@app.get("/v1/auth/roles")
+async def auth_roles():
+    return {"roles": [{"id": rid, "description": desc} for rid, desc in user_auth.UI_ROLES.items()]}
+
+
+# -- Settings -> Accounts & Roles (admin only) -------------------------------
+
+@app.get("/v1/auth/users")
+async def list_users(request: Request):
+    require_admin(request)
+    docs = await store.list_users()
+    return {"users": [user_auth.public_user(d["username"], d) for d in docs]}
+
+
+@app.post("/v1/auth/users")
+async def create_user(req: CreateUserRequest, request: Request):
+    require_admin(request)
+    if req.role not in user_auth.UI_ROLES:
+        raise HTTPException(status_code=400, detail=f"Unknown role '{req.role}'")
+    if await store.get_user(req.username):
+        raise HTTPException(status_code=409, detail=f"An account named '{req.username}' already exists.")
+    policy_error = user_auth.password_policy_error(req.password)
+    if policy_error:
+        raise HTTPException(status_code=400, detail=policy_error)
+
+    doc = user_auth.new_local_user_doc(
+        role=req.role,
+        password_hash=user_auth.hash_password(req.password),
+        source="local",
+        must_change_password=req.must_change_password,
+    )
+    await store.upsert_user(req.username, doc)
+    return {"user": user_auth.public_user(req.username.lower(), doc)}
+
+
+@app.put("/v1/auth/users/{username}")
+async def update_user(username: str, req: UpdateUserRequest, request: Request):
+    admin = require_admin(request)
+    doc = await store.get_user(username)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    is_default_admin = username.lower() == DEFAULT_ADMIN_USERNAME.lower()
+    is_self = username.lower() == admin["username"].lower()
+
+    if req.active is False and (is_default_admin or is_self):
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot disable the default admin account or your own account." if is_default_admin else "You cannot disable your own account.",
+        )
+
+    if req.role is not None:
+        if req.role not in user_auth.UI_ROLES:
+            raise HTTPException(status_code=400, detail=f"Unknown role '{req.role}'")
+        if is_default_admin and req.role != "admin":
+            raise HTTPException(status_code=400, detail="The default admin account must keep the admin role.")
+        doc["role"] = req.role
+
+    if req.active is not None:
+        doc["active"] = req.active
+
+    if req.password is not None:
+        if doc.get("source") != "local":
+            raise HTTPException(status_code=400, detail="This account authenticates via LDAP - it has no local password to set.")
+        policy_error = user_auth.password_policy_error(req.password)
+        if policy_error:
+            raise HTTPException(status_code=400, detail=policy_error)
+        doc["password_hash"] = user_auth.hash_password(req.password)
+
+    if req.must_change_password is not None:
+        doc["must_change_password"] = req.must_change_password
+
+    doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    await store.upsert_user(username, doc)
+    return {"user": user_auth.public_user(username.lower(), doc)}
+
+
+@app.delete("/v1/auth/users/{username}")
+async def delete_user(username: str, request: Request):
+    admin = require_admin(request)
+    if username.lower() == DEFAULT_ADMIN_USERNAME.lower():
+        raise HTTPException(status_code=400, detail="The default admin account cannot be deleted.")
+    if username.lower() == admin["username"].lower():
+        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
+    deleted = await store.delete_user(username)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return {"deleted": True, "username": username.lower()}
+
+
+# -- Settings -> LDAP Authentication (admin only) ----------------------------
+
+@app.get("/v1/auth/ldap-config")
+async def get_ldap_config(request: Request):
+    require_admin(request)
+    return {"config": user_auth.public_ldap_config(ldap_config)}
+
+
+@app.put("/v1/auth/ldap-config")
+async def put_ldap_config(req: LdapConfigRequest, request: Request):
+    """Save the LDAP policy. bind_password is only present in the request
+    body when the admin actually typed a new one in that field - omitted or
+    blank leaves the encrypted secret already on file untouched, so this
+    form never has to round-trip (or even know) the current secret."""
+    require_admin(request)
+    merged = {**ldap_config, **req.config}
+    merged.pop("bind_password_encrypted", None)  # never accepted directly from the client
+    normalized = user_auth.normalize_ldap_config(merged)
+    if normalized["ca_certificate"]:
+        try:
+            user_auth.parse_ca_certificate(normalized["ca_certificate"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Corporate CA certificate: {exc}")
+    if req.bind_password:
+        normalized["bind_password_encrypted"] = user_auth.encrypt_secret(req.bind_password)
+    else:
+        normalized["bind_password_encrypted"] = ldap_config.get("bind_password_encrypted", "")
+    await save_ldap_config(normalized)
+    return {"config": user_auth.public_ldap_config(ldap_config)}
+
+
+@app.post("/v1/auth/ldap-config/validate-ca")
+async def validate_ca_certificate(req: LdapCaCertificateRequest, request: Request):
+    """Parse (but don't save) a pasted/uploaded corporate CA certificate so
+    the Settings page can show its subject/issuer/expiry immediately -
+    before the admin commits to Save."""
+    require_admin(request)
+    try:
+        info = user_auth.parse_ca_certificate(req.ca_certificate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"valid": True, "info": info}
+
+
+@app.post("/v1/auth/ldap-config/test")
+async def test_ldap_config(req: LdapTestRequest, request: Request):
+    """Test the *saved* LDAP config (Save first, then Test) against one
+    real set of credentials - service-account bind, user search, and user
+    bind, exactly like a real login attempt would exercise."""
+    require_admin(request)
+    success, detail, is_admin = await user_auth.ldap_authenticate(ldap_config, req.username, req.password)
+    return {"success": success, "detail": detail, "would_be_admin": is_admin}

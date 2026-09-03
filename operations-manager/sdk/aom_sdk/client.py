@@ -8,7 +8,7 @@ branch on. `AOMClient` does all three, so integrating code looks like:
 
     from aom_sdk import AOMClient
 
-    client = AOMClient("http://localhost:8090", api_key="demo-support-agent-9f21")
+    client = AOMClient("https://localhost:8090", api_key="demo-support-agent-9f21", verify=False)  # self-signed by default
     discovered = client.discover("look up a customer's open tickets")
     result = client.invoke(discovered["tools"][0]["tool_id"], arguments={})
 
@@ -54,6 +54,16 @@ class AOMClient:
         Reuse an existing ``requests.Session`` (e.g. for connection pooling
         across many agent instances) instead of letting the client create
         its own.
+    verify:
+        TLS verification, passed straight to ``requests`` on every call:
+        ``True`` (default) verifies the server's certificate normally,
+        ``False`` disables verification entirely, and a string path
+        verifies against that specific CA bundle/certificate file instead
+        of the system trust store. The bundled Docker Compose stack serves
+        HTTPS with a self-signed certificate out of the box (see its
+        README), which fails verification under the default ``True`` -
+        pass ``False`` for that, or point ``verify`` at the exported
+        certificate, until you've installed a real one.
     """
 
     def __init__(
@@ -62,12 +72,14 @@ class AOMClient:
         api_key: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         session: Optional[requests.Session] = None,
+        verify: "bool | str" = True,
     ) -> None:
         if not base_url:
-            raise ValueError("base_url is required, e.g. AOMClient('http://localhost:8090')")
+            raise ValueError("base_url is required, e.g. AOMClient('https://localhost:8090')")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.verify = verify
         self._session = session or requests.Session()
 
     def __repr__(self) -> str:
@@ -102,6 +114,7 @@ class AOMClient:
                 json=json_body,
                 params=params,
                 timeout=self.timeout,
+                verify=self.verify,
             )
         except requests.RequestException as exc:
             raise AOMConnectionError(

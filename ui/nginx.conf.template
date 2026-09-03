@@ -1,6 +1,24 @@
+# Plain HTTP is redirect-only - every request gets sent to HTTPS on the same
+# host. Kept (rather than dropped) so an old bookmark/link to this origin
+# over http:// still lands somewhere useful instead of just failing to
+# connect.
 server {
     listen 80;
     server_name _;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name _;
+
+    # Self-signed by default (baked in at build time - see the Dockerfile)
+    # so this container serves HTTPS out of the box with zero
+    # configuration. For a real deployment, mount your own certificate over
+    # these same two paths - see docker-compose.yml.
+    ssl_certificate     /etc/nginx/tls/server.crt;
+    ssl_certificate_key /etc/nginx/tls/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
 
     root /usr/share/nginx/html;
     index index.html;
@@ -9,20 +27,36 @@ server {
     # know about its own origin - see OPERATIONS_MANAGER_UPSTREAM in
     # docker-compose.yml. This file is processed by nginx's docker
     # entrypoint (envsubst over /etc/nginx/templates/*.template) before the
-    # container starts, so ${OPERATIONS_MANAGER_UPSTREAM} below is resolved at
-    # boot, not at build time.
+    # container starts, so the ${...} variables below are resolved at boot,
+    # not at build time. (envsubst here is scoped to real environment
+    # variables only, so the nginx runtime variables like $host and $scheme
+    # elsewhere in this file are left alone.)
+    #
+    # OPERATIONS_MANAGER_SCHEME defaults to https - operations-manager
+    # serves TLS by default too (its own Dockerfile/docker-entrypoint.sh),
+    # so this hop is encrypted like everything else. proxy_ssl_verify is
+    # off because that's a self-signed certificate by default and this hop
+    # stays inside the docker-compose network's private bridge, not the
+    # open internet - the goal is opportunistic encryption in transit, not
+    # nginx authenticating operations-manager's identity. If you set
+    # DISABLE_TLS=true on operations-manager, set OPERATIONS_MANAGER_SCHEME=http
+    # here too so this proxy hop keeps matching what it's actually speaking.
     location /v1/ {
-        proxy_pass http://${OPERATIONS_MANAGER_UPSTREAM}/v1/;
+        proxy_pass ${OPERATIONS_MANAGER_SCHEME}://${OPERATIONS_MANAGER_UPSTREAM}/v1/;
+        proxy_ssl_verify off;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 60s;
     }
 
     location /api/ {
-        proxy_pass http://${OPERATIONS_MANAGER_UPSTREAM}/api/;
+        proxy_pass ${OPERATIONS_MANAGER_SCHEME}://${OPERATIONS_MANAGER_UPSTREAM}/api/;
+        proxy_ssl_verify off;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     location / {

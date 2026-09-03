@@ -19,8 +19,21 @@ ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl build-essential \
+RUN apt-get update && apt-get install -y --no-install-recommends curl build-essential openssl \
     && rm -rf /var/lib/apt/lists/*
+
+# Fallback self-signed TLS server certificate so this container serves
+# HTTPS out of the box with zero configuration (see docker-entrypoint.sh).
+# For a real deployment, mount your own certificate over these same two
+# paths (a docker-compose volume mount replaces these files, no image
+# rebuild or code change needed) - see docker-compose.yml.
+RUN mkdir -p /app/tls && \
+    openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+      -keyout /app/tls/server.key -out /app/tls/server.crt \
+      -subj "/CN=localhost" \
+      -addext "subjectAltName=DNS:localhost,DNS:operations-manager,DNS:agent-operations-manager,IP:127.0.0.1" \
+      2>/dev/null && \
+    chmod 600 /app/tls/server.key
 
 # Install the CPU-only build of torch first so pip doesn't pull in the
 # default CUDA/cuDNN/Triton-enabled build when resolving
@@ -38,9 +51,17 @@ COPY skills ./skills
 
 ENV TOKENIZERS_PARALLELISM=false
 
+COPY docker-entrypoint.sh .
+RUN chmod +x docker-entrypoint.sh
+
 EXPOSE 8090
 
+# Tries HTTPS first (the default - see docker-entrypoint.sh), then falls
+# back to plain HTTP, so this one healthcheck works whether or not
+# DISABLE_TLS is set. -k skips verifying the (self-signed, by default)
+# server certificate - this is a loopback healthcheck, not a client
+# validating the server's identity over an untrusted network.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=20 \
-    CMD curl -f http://localhost:8090/api/health || exit 1
+    CMD curl -kfs https://localhost:8090/api/health || curl -fs http://localhost:8090/api/health || exit 1
 
-CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090"]
+CMD ["./docker-entrypoint.sh"]

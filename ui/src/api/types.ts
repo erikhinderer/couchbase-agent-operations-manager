@@ -313,3 +313,48 @@ export interface LLMCompleteResponse {
   latency_ms: number;
   stub: boolean;
 }
+
+
+// --- Local dashboard login ---------------------------------------------
+
+export interface AuthUser {
+  username: string;
+  role: string;
+  source: "local" | "ldap";
+  active: boolean;
+  must_change_password: boolean;
+  has_password: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  last_login_at: string | null;
+}
+
+export interface AuthRole {
+  id: string;
+  description: string;
+}
+
+export interface LdapConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  use_ssl: boolean;
+  start_tls: boolean;
+  bind_dn: string;
+  bind_password_set: boolean;
+  user_search_base: string;
+  user_search_filter: string;
+  admin_group_dn: string;
+  group_member_attribute: string;
+  ca_certificate: string;
+  ca_certificate_info: CaCertificateInfo | null;
+}
+
+export interface CaCertificateInfo {
+  subject: string;
+  issuer: string;
+  not_valid_before: string;
+  not_valid_after: string;
+  is_expired: boolean;
+  error?: string;
+}

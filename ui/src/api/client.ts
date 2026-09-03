@@ -1,8 +1,12 @@
 import type {
   AuditLogEntry,
+  AuthRole,
+  AuthUser,
   DashboardResponse,
   Finding,
   HealthResponse,
+  LdapConfig,
+  CaCertificateInfo,
   LLMCacheConfig,
   LLMCacheEntry,
   LLMCompleteResponse,
@@ -25,6 +29,12 @@ class ApiError extends Error {
   }
 }
 
+// AuthProvider registers a handler here so any 401 from any call - not
+// just the /v1/auth/* ones - drops the app back to the login page (a
+// session cookie can expire mid-session on any page, not just on the
+// endpoints that issue it).
+let onUnauthorized: (() => void) | null = null;
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -38,6 +48,9 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     } catch {
       // ignore
     }
+    if (res.status === 401 && !path.startsWith("/v1/auth/login") && !path.startsWith("/v1/auth/bootstrap")) {
+      onUnauthorized?.();
+    }
     throw new ApiError(res.status, detail);
   }
   if (res.status === 204) return undefined as T;
@@ -45,9 +58,61 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
+  setUnauthorizedHandler: (fn: (() => void) | null) => {
+    onUnauthorized = fn;
+  },
+
   health: () => request<HealthResponse>("/api/health"),
 
   roles: () => request<{ roles: Role[] }>("/v1/roles"),
+
+  // -- Local dashboard login ------------------------------------------
+  authBootstrapStatus: () => request<{ needs_setup: boolean; username: string }>("/v1/auth/bootstrap-status"),
+  authBootstrap: (password: string) =>
+    request<{ user: AuthUser }>("/v1/auth/bootstrap", { method: "POST", body: JSON.stringify({ password }) }),
+  authLogin: (username: string, password: string) =>
+    request<{ user: AuthUser }>("/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
+  authLogout: () => request<{ logged_out: boolean }>("/v1/auth/logout", { method: "POST" }),
+  authMe: () => request<{ user: AuthUser }>("/v1/auth/me"),
+  authChangePassword: (currentPassword: string, newPassword: string) =>
+    request<{ user: AuthUser }>("/v1/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    }),
+  authRoles: () => request<{ roles: AuthRole[] }>("/v1/auth/roles"),
+
+  authUsers: () => request<{ users: AuthUser[] }>("/v1/auth/users"),
+  createAuthUser: (payload: { username: string; password: string; role: string; must_change_password: boolean }) =>
+    request<{ user: AuthUser }>("/v1/auth/users", { method: "POST", body: JSON.stringify(payload) }),
+  updateAuthUser: (
+    username: string,
+    patch: { role?: string; active?: boolean; password?: string; must_change_password?: boolean }
+  ) =>
+    request<{ user: AuthUser }>(`/v1/auth/users/${encodeURIComponent(username)}`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
+  deleteAuthUser: (username: string) =>
+    request<{ deleted: boolean; username: string }>(`/v1/auth/users/${encodeURIComponent(username)}`, {
+      method: "DELETE",
+    }),
+
+  ldapConfig: () => request<{ config: LdapConfig }>("/v1/auth/ldap-config"),
+  saveLdapConfig: (config: Record<string, unknown>, bindPassword?: string) =>
+    request<{ config: LdapConfig }>("/v1/auth/ldap-config", {
+      method: "PUT",
+      body: JSON.stringify({ config, bind_password: bindPassword || undefined }),
+    }),
+  testLdapConfig: (username: string, password: string) =>
+    request<{ success: boolean; detail: string; would_be_admin: boolean }>("/v1/auth/ldap-config/test", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  validateCaCertificate: (caCertificate: string) =>
+    request<{ valid: boolean; info: CaCertificateInfo }>("/v1/auth/ldap-config/validate-ca", {
+      method: "POST",
+      body: JSON.stringify({ ca_certificate: caCertificate }),
+    }),
 
   sdkInfo: () => request<SdkInfo>("/v1/sdk/info"),
   skillInfo: (platform: string) => request<SkillInfo>(`/v1/skills/${platform}/info`),

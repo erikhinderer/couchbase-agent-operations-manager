@@ -124,7 +124,11 @@ LLM_CACHE_LOOKBACK_ENTRIES = int(os.getenv("LLM_CACHE_LOOKBACK_ENTRIES", "2000")
 # changing it invalidates every existing session and re-encrypts nothing
 # already stored, so rotate LDAP bind creds afterward if you change it in
 # production.
-AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "dev-only-insecure-secret-change-me")
+# "or", not just the getenv default, so an *empty* env var (a .env
+# hand-copied from .env.example without running start.sh, which is what
+# actually generates one) still falls back instead of signing sessions
+# and encrypting the LDAP bind password with an empty string.
+AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY") or "dev-only-insecure-secret-change-me"
 
 # How long a browser session stays signed in before the login page reappears.
 AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "12"))

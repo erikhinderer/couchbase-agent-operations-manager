@@ -30,7 +30,7 @@ the appliance's REST API that should be replaced.
 from the appliance itself. Get it one of two ways:
 
 - The appliance's dashboard: **Tools -> Developer SDK -> Download SDK**.
-- Directly: `curl -o aom-sdk.zip http://<appliance-host>:8090/v1/sdk/download`
+- Directly: `curl -k -o aom-sdk.zip https://<appliance-host>:8090/v1/sdk/download` (`-k` skips verifying the appliance's certificate - it's self-signed by default; drop it once a real one is installed)
   (default port `8090`; adjust the host for the target deployment).
 
 Then, from the project that will depend on it:
@@ -60,8 +60,12 @@ import os
 from aom_sdk import AOMClient
 
 client = AOMClient(
-    base_url=os.environ["AOM_BASE_URL"],   # e.g. "http://localhost:8090"
+    base_url=os.environ["AOM_BASE_URL"],   # e.g. "https://localhost:8090"
     api_key=os.environ.get("AOM_API_KEY"),  # the agent's RBAC role's key
+    # The appliance serves HTTPS with a self-signed certificate by default -
+    # this reads AOM_VERIFY_SSL (default "false") the same way the bundled
+    # SDK examples do; set it to "true" once a real certificate is installed.
+    verify=os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true",
 )
 ```
 
@@ -98,8 +102,8 @@ adapter. Point it at the bundled bridge instead:
 
 ```bash
 pip install "couchbase-aom-sdk[mcp]"
-AOM_BASE_URL=http://localhost:8090 AOM_API_KEY=<role-api-key> \
-    python -m aom_sdk.mcp_server
+AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=<role-api-key> \
+    AOM_VERIFY_SSL=false python -m aom_sdk.mcp_server
 ```
 
 This runs AOM as a local MCP server over stdio: `list_tools` returns the

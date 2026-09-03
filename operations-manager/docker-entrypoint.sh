@@ -1,0 +1,28 @@
+#!/bin/sh
+# Serves HTTPS by default, using the TLS cert/key at /app/tls - a
+# self-signed pair baked in at build time (see the Dockerfile) unless
+# you've mounted your own real certificate over the same two paths.
+#
+# Set DISABLE_TLS=true to fall back to plain HTTP instead - e.g. when a
+# reverse proxy or load balancer already in front of this container
+# terminates TLS and re-encrypting here would just be redundant.
+set -e
+
+TLS_KEY_FILE="${TLS_KEY_FILE:-/app/tls/server.key}"
+TLS_CERT_FILE="${TLS_CERT_FILE:-/app/tls/server.crt}"
+
+if [ "${DISABLE_TLS:-false}" = "true" ]; then
+  echo "[entrypoint] DISABLE_TLS=true - serving plain HTTP on :8090"
+  exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8090
+fi
+
+if [ ! -f "$TLS_KEY_FILE" ] || [ ! -f "$TLS_CERT_FILE" ]; then
+  echo "[entrypoint] TLS cert/key not found at $TLS_CERT_FILE / $TLS_KEY_FILE - falling back to plain HTTP." >&2
+  echo "[entrypoint] This shouldn't happen with the bundled image (a fallback cert is baked in) unless a volume mount replaced /app/tls without both files. Set DISABLE_TLS=true to silence this." >&2
+  exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8090
+fi
+
+echo "[entrypoint] Serving HTTPS on :8090 (cert: $TLS_CERT_FILE)"
+exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8090 \
+  --ssl-keyfile "$TLS_KEY_FILE" \
+  --ssl-certfile "$TLS_CERT_FILE"

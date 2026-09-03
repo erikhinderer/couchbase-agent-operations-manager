@@ -18,10 +18,13 @@ Requires the optional `mcp` dependency:
 
 Run directly:
 
-    AOM_BASE_URL=http://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 \\
+    AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 \\
         python -m aom_sdk.mcp_server
 
-Then point any MCP-compatible host at this process over stdio.
+Then point any MCP-compatible host at this process over stdio. The bundled
+appliance serves HTTPS with a self-signed certificate by default, so this
+skips verifying it unless AOM_VERIFY_SSL=true (see AOMClient's own
+``verify`` parameter) - set that once you've installed a real certificate.
 """
 from __future__ import annotations
 
@@ -127,15 +130,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     _require_mcp()
     logging.basicConfig(level=os.environ.get("AOM_MCP_LOG_LEVEL", "WARNING"))
 
-    base_url = os.environ.get("AOM_BASE_URL", "http://localhost:8090")
+    base_url = os.environ.get("AOM_BASE_URL", "https://localhost:8090")
     api_key = os.environ.get("AOM_API_KEY")
     if not api_key:
         raise SystemExit(
             "Set AOM_API_KEY to the RBAC role's API key this MCP server should act as "
             "(e.g. AOM_API_KEY=demo-support-agent-9f21)."
         )
+    verify = os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true"
 
-    client = AOMClient(base_url=base_url, api_key=api_key)
+    client = AOMClient(base_url=base_url, api_key=api_key, verify=verify)
     server = AOMMCPServer(client)
     asyncio.run(server.run_stdio())
 

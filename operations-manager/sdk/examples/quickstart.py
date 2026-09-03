@@ -5,7 +5,14 @@ things almost every agent integration needs from the Couchbase Agent
 Operations Manager.
 
 Run with:
-    AOM_BASE_URL=http://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 python examples/quickstart.py
+    AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 python examples/quickstart.py
+
+The bundled Docker Compose stack serves HTTPS with a self-signed
+certificate out of the box, which AOMClient's default verify=True would
+reject - these examples pass AOM_VERIFY_SSL=false (the default below) to
+skip that check. Once you've installed a real certificate (see
+docker-compose.yml), set AOM_VERIFY_SSL=true, or leave it unset and rely
+on AOMClient's own secure-by-default verify=True.
 """
 import os
 
@@ -14,8 +21,12 @@ from aom_sdk import AOMClient
 
 def main() -> None:
     client = AOMClient(
-        base_url=os.environ.get("AOM_BASE_URL", "http://localhost:8090"),
+        base_url=os.environ.get("AOM_BASE_URL", "https://localhost:8090"),
         api_key=os.environ.get("AOM_API_KEY"),
+        # The bundled appliance serves HTTPS with a self-signed certificate
+        # by default (see quickstart.py) - AOM_VERIFY_SSL=true once you've
+        # installed a real one.
+        verify=os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true",
     )
 
     print("Health:", client.health())

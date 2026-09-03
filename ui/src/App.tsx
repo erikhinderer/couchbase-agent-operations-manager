@@ -1,4 +1,4 @@
-import { Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router-dom";
 import { Sidebar } from "./components/nav/Sidebar";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ServersPage } from "./pages/ServersPage";
@@ -11,8 +11,42 @@ import { InsightsPage } from "./pages/InsightsPage";
 import { AuditLogPage } from "./pages/AuditLogPage";
 import { AgentToolAuditPage } from "./pages/AgentToolAuditPage";
 import { DeveloperSdkPage } from "./pages/DeveloperSdkPage";
+import { SettingsAccountsPage } from "./pages/SettingsAccountsPage";
+import { SettingsLdapPage } from "./pages/SettingsLdapPage";
+import { LoginPage } from "./pages/LoginPage";
+import { RequirePasswordChangePage } from "./pages/RequirePasswordChangePage";
+import { useAuth } from "./auth/AuthContext";
+
+// Settings (local accounts, roles, LDAP) is admin-only. The Sidebar
+// already hides the nav section for a non-admin, but a direct URL visit
+// still needs to be turned away here - the API itself also enforces this
+// (403), so this is about a clean redirect, not the actual security
+// boundary.
+function AdminRoute({ children }: { children: JSX.Element }) {
+  const { user } = useAuth();
+  if (user?.role !== "admin") return <Navigate to="/" replace />;
+  return children;
+}
 
 export default function App() {
+  const { user, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="login-shell">
+        <div className="loading-note">Loading...</div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <LoginPage />;
+  }
+
+  if (user.must_change_password) {
+    return <RequirePasswordChangePage />;
+  }
+
   return (
     <div className="app-shell">
       <Sidebar />
@@ -29,6 +63,22 @@ export default function App() {
           <Route path="/audit-log" element={<AuditLogPage />} />
           <Route path="/agent-tool-audit" element={<AgentToolAuditPage />} />
           <Route path="/developer-sdk" element={<DeveloperSdkPage />} />
+          <Route
+            path="/settings/accounts"
+            element={
+              <AdminRoute>
+                <SettingsAccountsPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/settings/ldap"
+            element={
+              <AdminRoute>
+                <SettingsLdapPage />
+              </AdminRoute>
+            }
+          />
         </Routes>
       </main>
     </div>

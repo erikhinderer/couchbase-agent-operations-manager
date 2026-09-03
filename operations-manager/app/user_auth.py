@@ -31,6 +31,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import ssl
 import time
 from datetime import datetime, timezone
 
@@ -38,6 +39,7 @@ import bcrypt
 import jwt
 import ldap3
 from ldap3.utils.conv import escape_filter_chars
+from cryptography import x509
 from cryptography.fernet import Fernet, InvalidToken
 
 from config import AUTH_SECRET_KEY, AUTH_SESSION_TTL_HOURS
@@ -170,6 +172,14 @@ DEFAULT_LDAP_CONFIG = {
     "user_search_filter": "(uid={username})",
     "admin_group_dn": "",
     "group_member_attribute": "memberOf",
+    # PEM-encoded corporate CA certificate (or chain) used to validate the
+    # directory's LDAPS/StartTLS certificate. Not a secret - a CA cert is
+    # public by design - so unlike bind_password_encrypted it is stored (and
+    # may be returned over the API) as plain text. Empty means "use ldap3's
+    # default TLS behavior", which is the same permissive (no verification)
+    # mode this appliance has always used for LDAPS/StartTLS, so leaving
+    # this unset is not a regression for existing deployments.
+    "ca_certificate": "",
 }
 
 
@@ -189,6 +199,38 @@ def normalize_ldap_config(cfg: dict | None) -> dict:
         "user_search_filter": str(merged.get("user_search_filter") or "(uid={username})").strip(),
         "admin_group_dn": str(merged.get("admin_group_dn") or "").strip(),
         "group_member_attribute": str(merged.get("group_member_attribute") or "memberOf").strip(),
+        "ca_certificate": str(merged.get("ca_certificate") or "").strip(),
+    }
+
+
+def parse_ca_certificate(pem_text: str) -> dict:
+    """Validate a PEM-encoded certificate (or chain - only the first cert is
+    inspected for display) and return the metadata the Settings UI shows so
+    an admin can confirm they installed the right one before saving.
+
+    Raises ValueError with a human-readable message on anything that isn't
+    a parseable X.509 certificate; callers should turn that into a 400.
+    """
+    text = (pem_text or "").strip()
+    if not text:
+        raise ValueError("No certificate provided.")
+    try:
+        cert = x509.load_pem_x509_certificate(text.encode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Could not parse as a PEM X.509 certificate: {exc}") from exc
+
+    def _name(name: x509.Name) -> str:
+        try:
+            return name.rfc4514_string()
+        except Exception:  # noqa: BLE001
+            return str(name)
+
+    return {
+        "subject": _name(cert.subject),
+        "issuer": _name(cert.issuer),
+        "not_valid_before": cert.not_valid_before_utc.isoformat(),
+        "not_valid_after": cert.not_valid_after_utc.isoformat(),
+        "is_expired": cert.not_valid_after_utc <= datetime.now(timezone.utc),
     }
 
 
@@ -198,6 +240,17 @@ def public_ldap_config(cfg: dict | None) -> dict:
     normalized = normalize_ldap_config(cfg)
     public = {k: v for k, v in normalized.items() if k != "bind_password_encrypted"}
     public["bind_password_set"] = bool(normalized.get("bind_password_encrypted"))
+    ca_certificate = normalized.get("ca_certificate") or ""
+    if ca_certificate:
+        try:
+            public["ca_certificate_info"] = parse_ca_certificate(ca_certificate)
+        except ValueError as exc:
+            # Shouldn't happen for anything saved via put_ldap_config (which
+            # validates first), but don't let a bad stored value break the
+            # settings page from loading.
+            public["ca_certificate_info"] = {"error": str(exc)}
+    else:
+        public["ca_certificate_info"] = None
     return public
 
 
@@ -213,7 +266,24 @@ async def ldap_authenticate(cfg: dict, username: str, password: str) -> tuple[bo
         if not cfg.get("host") or not cfg.get("user_search_base"):
             return False, "LDAP is not fully configured (host/user search base missing).", False
 
-        server = ldap3.Server(cfg["host"], port=cfg["port"], use_ssl=cfg["use_ssl"], get_info=ldap3.NONE)
+        tls = None
+        ca_certificate = (cfg.get("ca_certificate") or "").strip()
+        if ca_certificate:
+            # Explicit corporate CA installed: require and verify against
+            # it. Without this, ldap3's default Tls (no explicit `tls=`
+            # passed to Server) does not validate the server certificate at
+            # all - so this only ever makes LDAPS/StartTLS *stricter* than
+            # the appliance's previous behavior, never looser.
+            try:
+                tls = ldap3.Tls(
+                    ca_certs_data=ca_certificate.encode("utf-8"),
+                    validate=ssl.CERT_REQUIRED,
+                    version=ssl.PROTOCOL_TLS_CLIENT,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return False, f"Could not load configured corporate CA certificate: {exc}", False
+
+        server = ldap3.Server(cfg["host"], port=cfg["port"], use_ssl=cfg["use_ssl"], get_info=ldap3.NONE, tls=tls)
         bind_password = decrypt_secret(cfg.get("bind_password_encrypted", ""))
 
         try:

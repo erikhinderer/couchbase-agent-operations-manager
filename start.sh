@@ -45,8 +45,8 @@ docker compose up --build
 echo
 echo "=================================================================="
 echo " Ready. Open:"
-echo "   Dashboard             -> http://localhost:5173"
-echo "   Operations Manager API -> http://localhost:8090  (see /docs)"
-echo "   Couchbase Web Console -> http://localhost:8091"
+echo "   Dashboard             -> https://localhost:5173  (self-signed cert - your browser will warn)"
+echo "   Operations Manager API -> https://localhost:8090  (see /docs; curl needs -k, SDK needs verify=False)"
+echo "   Couchbase Web Console -> http://localhost:8091  (not covered by this appliance's TLS setup)"
 echo "     (Administrator / CouchbaseDemo123! by default)"
 echo "=================================================================="

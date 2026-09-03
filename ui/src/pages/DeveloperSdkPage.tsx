@@ -16,8 +16,9 @@ pip install .`;
 const QUICKSTART_CODE = `from aom_sdk import AOMClient
 
 client = AOMClient(
-    base_url="http://localhost:8090",   # your operations-manager origin
+    base_url="https://localhost:8090",  # your operations-manager origin
     api_key="demo-support-agent-9f21",  # your RBAC role's API key
+    verify=False,  # self-signed by default - drop this once you've installed a real cert
 )
 
 # 1. Discover tools for a task - RBAC + vector-search pre-filtered.
@@ -61,7 +62,7 @@ result = client.invoke_mcp_tool(mcp_tools[0]["name"], arguments={})
 
 # Or run this appliance as a real local MCP server any MCP host can attach
 # to (pip install "couchbase-aom-sdk[mcp]"):
-#   AOM_BASE_URL=http://localhost:8090 AOM_API_KEY=... python -m aom_sdk.mcp_server`;
+#   AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=... AOM_VERIFY_SSL=false python -m aom_sdk.mcp_server`;
 
 const SKILL_PLATFORMS: Array<{ platform: string; label: string; blurb: string }> = [
   { platform: "chatgpt", label: "ChatGPT Skill", blurb: "Custom GPT instructions, an Assistants/Responses system message, or an AGENTS.md file." },

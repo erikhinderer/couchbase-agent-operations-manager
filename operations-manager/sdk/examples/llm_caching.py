@@ -6,7 +6,7 @@ appliance's Tools -> Developer SDK page for the cost/latency math behind
 why this matters at scale.
 
 Run with:
-    AOM_BASE_URL=http://localhost:8090 AOM_API_KEY=demo-admin-4c56 python examples/llm_caching.py
+    AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=demo-admin-4c56 python examples/llm_caching.py
 """
 import os
 
@@ -26,8 +26,12 @@ def show(label: str, answer: dict) -> None:
 
 def main() -> None:
     client = AOMClient(
-        base_url=os.environ.get("AOM_BASE_URL", "http://localhost:8090"),
+        base_url=os.environ.get("AOM_BASE_URL", "https://localhost:8090"),
         api_key=os.environ.get("AOM_API_KEY"),
+        # The bundled appliance serves HTTPS with a self-signed certificate
+        # by default (see quickstart.py) - AOM_VERIFY_SSL=true once you've
+        # installed a real one.
+        verify=os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true",
     )
 
     prompt = "What is our policy on refunds for orders older than 30 days?"

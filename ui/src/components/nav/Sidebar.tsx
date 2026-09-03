@@ -4,11 +4,14 @@ import { api } from "../../api/client";
 import type { HealthResponse } from "../../api/types";
 import { ThemeToggle } from "../common/ThemeToggle";
 import { CouchbaseGlyph } from "../common/CouchbaseLogo";
+import { useAuth } from "../../auth/AuthContext";
 
-const NAV_SECTIONS: Array<{
+type NavSection = {
   label: string;
   items: Array<{ to: string; icon: string; text: string; exact?: boolean }>;
-}> = [
+};
+
+const NAV_SECTIONS: NavSection[] = [
   {
     label: "Overview",
     items: [{ to: "/", icon: "▦", text: "Dashboard", exact: true }],
@@ -45,7 +48,20 @@ const NAV_SECTIONS: Array<{
   },
 ];
 
+// Rendered as its own section below Tools, and only for admins (see
+// Sidebar() below) - Settings is where local accounts, their roles, and
+// LDAP authentication get managed, none of which a non-admin should even
+// see exists.
+const SETTINGS_SECTION: NavSection = {
+  label: "Settings",
+  items: [
+    { to: "/settings/accounts", icon: "◍", text: "Accounts & Roles" },
+    { to: "/settings/ldap", icon: "⌁", text: "LDAP Authentication" },
+  ],
+};
+
 export function Sidebar() {
+  const { user, logout } = useAuth();
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -86,7 +102,7 @@ export function Sidebar() {
         <ThemeToggle />
       </div>
 
-      {NAV_SECTIONS.map((section) => (
+      {[...NAV_SECTIONS, ...(user?.role === "admin" ? [SETTINGS_SECTION] : [])].map((section) => (
         <div className="nav-section" key={section.label}>
           <div className="nav-section-label">{section.label}</div>
           {section.items.map((item) => (
@@ -113,6 +129,17 @@ export function Sidebar() {
           <span className={`status-dot${connected ? "" : " down"}`} />
           {failed ? "Operations manager unreachable" : connected ? "Couchbase connected" : "Starting..."}
         </div>
+        {user && (
+          <div className="session-row">
+            <div>
+              <div className="session-user">{user.username}</div>
+              <div className="session-role">{user.role}{user.source === "ldap" ? " · LDAP" : ""}</div>
+            </div>
+            <button className="btn btn-secondary btn-sm" onClick={logout}>
+              Sign out
+            </button>
+          </div>
+        )}
       </div>
     </aside>
   );

@@ -4,6 +4,12 @@ operations-manager/certs/
 sample-mcp-servers/certs/
 ui/certs/
 
+# Real TLS certificates for a production deployment, if you've dropped
+# your own here instead of using the baked-in self-signed fallback (see
+# docker-compose.yml) - private keys should never be committed.
+operations-manager/tls/
+ui/tls/
+
 # Python bytecode from running the operations manager outside Docker.
 __pycache__/
 *.pyc

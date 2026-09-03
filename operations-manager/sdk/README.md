@@ -24,14 +24,27 @@ pip install -e .
 
 Requires Python 3.8+ and `requests`.
 
+## TLS
+
+The bundled Docker Compose stack serves HTTPS everywhere (dashboard and
+API) with a self-signed certificate baked in by default - see the repo
+README and `docker-compose.yml` for how to swap in a real one.
+`AOMClient` verifies certificates by default (`verify=True`), which
+rejects that self-signed cert; pass `verify=False` (as the examples
+below do, via `AOM_VERIFY_SSL=false`) until you've installed a real
+certificate, or point `verify` at the exported cert file instead of
+disabling verification entirely.
+
 ## Quickstart
 
 ```python
 from aom_sdk import AOMClient
 
 client = AOMClient(
-    base_url="http://localhost:8090",   # your operations-manager origin
+    base_url="https://localhost:8090",  # your operations-manager origin
     api_key="demo-support-agent-9f21",  # your RBAC role's API key
+    verify=False,  # the bundled Docker Compose stack's cert is self-signed by
+                   # default - drop this once you've installed a real one
 )
 
 # 1. Discover tools for a task - RBAC + vector-search pre-filtered, never a
@@ -90,8 +103,8 @@ SDK makes that protocol visible on the client side too:
   with:
 
   ```bash
-  AOM_BASE_URL=http://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 \
-      python -m aom_sdk.mcp_server
+  AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 \
+      AOM_VERIFY_SSL=false python -m aom_sdk.mcp_server
   ```
 
   See `examples/mcp_tools.py`.
@@ -124,7 +137,7 @@ Every non-2xx response raises a typed exception from `aom_sdk`:
 ```python
 from aom_sdk import AOMClient, AOMAuthorizationError
 
-client = AOMClient("http://localhost:8090", api_key="demo-support-agent-9f21")
+client = AOMClient("https://localhost:8090", api_key="demo-support-agent-9f21", verify=False)
 try:
     client.invoke("billing-service::refund_customer", arguments={"order_id": "123"})
 except AOMAuthorizationError as exc:

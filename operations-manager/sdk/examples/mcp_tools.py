@@ -3,7 +3,7 @@ Demonstrates the MCP tool integration: discover tools the way an MCP host
 would see them, and invoke one by its MCP name.
 
 Run with:
-    AOM_BASE_URL=http://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 python examples/mcp_tools.py
+    AOM_BASE_URL=https://localhost:8090 AOM_API_KEY=demo-support-agent-9f21 python examples/mcp_tools.py
 """
 import json
 import os
@@ -13,8 +13,12 @@ from aom_sdk import AOMClient
 
 def main() -> None:
     client = AOMClient(
-        base_url=os.environ.get("AOM_BASE_URL", "http://localhost:8090"),
+        base_url=os.environ.get("AOM_BASE_URL", "https://localhost:8090"),
         api_key=os.environ.get("AOM_API_KEY"),
+        # The bundled appliance serves HTTPS with a self-signed certificate
+        # by default (see quickstart.py) - AOM_VERIFY_SSL=true once you've
+        # installed a real one.
+        verify=os.environ.get("AOM_VERIFY_SSL", "false").lower() == "true",
     )
 
     mcp_tools = client.discover_mcp_tools("look up a customer's open support tickets", top_k=3)
