@@ -9,6 +9,8 @@ Search pre-filtering** - a single Search (FTS) request that narrows the
 candidate tool set by role and trust status *before/alongside* ranking by
 semantic similarity, not after.
 
+SDK and Claude, ChatGPT and Gemini skills included under Tools that can build a new agent with the SDK connected to the deployment or use Claude, ChatGPT or Gemini to configure your existing agent(s) for use.
+
 ## The problem this solves
 
 Most MCP-using agents today treat every configured MCP server, and every
