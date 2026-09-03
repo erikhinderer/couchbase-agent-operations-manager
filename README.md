@@ -9,13 +9,6 @@ Search pre-filtering** - a single Search (FTS) request that narrows the
 candidate tool set by role and trust status *before/alongside* ranking by
 semantic similarity, not after.
 
-This grew out of a demo of the same idea
-(`couchbase-mcp-access-server-demo`); this version turns the operations manager
-into something you'd actually stand up and keep running - register real
-MCP servers instead of hardcoded ones, an admin dashboard instead of a
-side-by-side comparison UI, and an insights engine that flags RBAC/catalog
-hygiene issues instead of a fixed script of "try these presets."
-
 ## The problem this solves
 
 Most MCP-using agents today treat every configured MCP server, and every
