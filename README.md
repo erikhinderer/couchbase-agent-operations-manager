@@ -48,6 +48,16 @@ review stop an *unregistered* tool from ever being reachable; hijacking
 detection is what catches a *registered, reviewed* tool whose description
 or live output has been poisoned.
 
+The same "one governed choke point" argument applies to the *other* half of
+an agent's traffic - its model calls - which is what **[LLM caching for
+agents](#llm-caching-for-agents)** adds: agents route completions through
+`/v1/llm/complete` against Claude, ChatGPT or Gemini, answers are cached in
+Couchbase by exact hash and by vector similarity, and the tokens a repeat
+question would have cost are never spent. Cache invalidation is policy, not
+guesswork - TTL, reuse limits, model/policy/catalog change detection, scope
+and namespace, never-cache rules and manual purge - and a dashboard reports
+what the caching actually saved.
+
 ## Architecture
 
 ```
@@ -62,6 +72,7 @@ or live output has been poisoned.
                                     ┌───────────┐
                                     │ Couchbase │  servers / tools /
                                     │           │  identities / access_log
+                                    │           │  llm_cache / llm_cache_log
                                     └───────────┘
                                           ▲
                                           │
@@ -78,7 +89,8 @@ Five containers:
   depends on is rejected outright by Community Edition. Free to run for
   development/testing under Couchbase's standard license.
 - **couchbase-init** - one-shot provisioning: bucket/scope/collections
-  (`servers`, `tools`, `identities`, `access_log`) and primary indexes.
+  (`servers`, `tools`, `identities`, `access_log`, `llm_cache`,
+  `llm_cache_log`, `settings`) and primary indexes.
 - **sample-mcp-servers** - six bundled mock MCP tool servers so the
   appliance is testable immediately, no real credentials needed: `jira`,
   `zendesk`, `snowflake` (well-behaved), `docs-search` and `web-search`
@@ -93,7 +105,8 @@ Five containers:
   invoke, and writes an audit-log entry for every decision. Also runs the
   MCP Tool Hijacking detector: a metadata scan at ingest time, a response
   scan on every invoke, and a background monitor that re-scans the catalog
-  on a timer.
+  on a timer. Finally, it is the LLM caching gateway - see [LLM caching for
+  agents](#llm-caching-for-agents).
 - **ui** - the admin dashboard (React + TypeScript + Vite, served by nginx): a
   live findings/insights feed, server registration, the tool catalog, roles,
   the audit log, and an Agent Tool Audit for calling discover/invoke directly.
@@ -153,6 +166,9 @@ model (~100MB, cached afterwards) - give it a few minutes. Then open:
 - **Couchbase Web Console**: <http://localhost:8091> (`Administrator` /
   `CouchbaseDemo123!` by default)
 
+LLM caching is on by default and needs no API key to try - see
+[LLM caching for agents](#llm-caching-for-agents).
+
 `docker compose down -v` gives you a fully clean start (drops the
 Couchbase and embedding-model-cache volumes).
 
@@ -183,6 +199,16 @@ Couchbase and embedding-model-cache volumes).
   a role/tool pair, and critical-risk tool usage. Everything except the
   quarantine state itself is recomputed on every load, nothing extra
   stored.
+- **LLM Caching -> Cache Dashboard** - tokens saved, estimated cost saved,
+  hit rate and latency avoided; hits-vs-provider-calls over the last 12
+  hours; how requests were resolved (exact / semantic / provider call /
+  bypassed / error); savings broken down by provider and model; the cache
+  contents with each entry's live policy verdict; and the recent cache
+  event stream.
+- **LLM Caching -> Providers & Policy** - pick Claude, ChatGPT or Gemini
+  and a model, tune exact/semantic matching, configure every invalidation
+  rule, and send a test completion to watch a miss turn into a hit. See
+  [LLM caching for agents](#llm-caching-for-agents).
 - **Audit Log** - every discover/invoke/authenticate decision, live-
   refreshing, filterable by action and decision.
 - **Agent Tool Audit** - paste in a role's API key and call `discover`/`invoke`
@@ -254,6 +280,94 @@ invoke it from the Agent Tool Audit as any role, then invoke
 `snowflake::manage_users` shortly after as `admin`, and watch a critical
 cross-tool hijack chain finding appear on Insights and Threat Detection.
 
+## LLM caching for agents
+
+The same argument as the tool gateway, applied to model calls: an agent
+that routes its completions through one governed choke point gets policy,
+an audit trail - and a cache. Point an agent at `POST /v1/llm/complete`
+with the API key it already uses for tool discovery and the operations
+manager answers from Couchbase whenever it can, so the tokens are never
+spent at all.
+
+### Choosing the LLM
+
+Claude, ChatGPT and Gemini are all selectable from **LLM Caching ->
+Providers & Policy**, each with its own model list and list-price
+estimates (`operations-manager/app/llm_cache.py`). Set
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY` in `.env` to
+proxy calls for real.
+
+**No key is required to try it.** A provider with no key configured
+answers a cache miss from a clearly-labelled deterministic stub, so
+caching, savings accounting and invalidation all behave identically with
+no outbound network access - the same "works on first boot" posture as the
+bundled sample MCP servers. A key that *is* configured and then fails
+raises, rather than silently writing fabricated text into the cache.
+
+### How a prompt matches
+
+1. **Exact** - SHA-256 of the normalized prompt (whitespace collapsed,
+   case-folded) plus provider, model, namespace, scope and parameters.
+   Resolved with a single KV get on a deterministic document ID.
+2. **Semantic** - the fallback that catches paraphrases, reusing the
+   catalog's own pattern: a Couchbase Search request combining vector kNN
+   over the prompt embedding with a Conjunction pre-filter on provider,
+   model, scope and namespace, so an entry belonging to another model or
+   another tenant can never be returned however similar the prompt.
+   Anything below the configured similarity threshold is a miss.
+
+### Cache invalidation
+
+Everything below is configurable during setup, evaluated by one function
+(`llm_cache.evaluate_entry`) that the read path, the background sweeper
+and the Cache Entries table all share - so what the UI shows and what the
+gateway does cannot drift apart.
+
+| Option | What it does |
+|---|---|
+| **TTL** | Written as a Couchbase document expiry *and* checked on read, so the cluster reclaims space even if the sweeper never runs. |
+| **Stale-while-revalidate** | Grace window after the TTL during which a past-due answer is still served. |
+| **Max entries + eviction policy** | LRU, LFU or FIFO once the cache is full. |
+| **Max reuses per entry** | Retire an answer after N hits so a hot prompt is periodically re-verified against the provider. |
+| **On model change** | Drop answers produced by the previously selected model. Entries created by an explicit per-request override are kept. |
+| **On policy change** | Drop everything when a setting that changes what an answer *means* moves - namespace, cache scope, similarity threshold, generation parameters. |
+| **On catalog change** | Drop everything when the vetted tool catalog changes, since an agent's answer can depend on which tools it was allowed to see. |
+| **Cache scope** | `global`, `per_role` or `per_subject` - trade hit rate for isolation. |
+| **Namespace** | A soft invalidation lever: bump it (after a prompt-template change, say) and older entries stop matching without deleting anything. |
+| **Never-cache rules** | Regex patterns for time-sensitive prompts, plus RBAC roles that always bypass the cache. |
+| **Manual purge** | Everything, or narrowed to one provider, model or namespace. |
+
+A background sweeper applies the rules on a timer to entries nobody reads;
+a read that notices a stale entry deletes it on the spot; and saving a
+policy that invalidates runs the sweep immediately, so the setup page
+reports what it just invalidated.
+
+### Calling it
+
+```bash
+curl -X POST http://localhost:8090/v1/llm/complete \
+  -H "Authorization: Bearer demo-admin-4c56" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Summarise the RBAC model in three sentences."}'
+```
+
+The response carries the answer plus `cache.status`
+(`hit_exact` / `hit_semantic` / `miss` / `bypass`), the similarity that
+earned a semantic hit, token usage, and what the hit saved. Send the same
+prompt twice to watch the second one cost nothing. `provider` and `model`
+can be overridden per request; `bypass_cache: true` forces a live call.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/llm/providers` | Selectable LLMs, their models and pricing, and which have a key configured (never the key). |
+| `GET` / `PUT /v1/llm/config` | Read and save the cache policy. Every value is re-validated server-side. |
+| `POST /v1/llm/complete` | The caching gateway. Authenticated exactly like discover/invoke. |
+| `GET /v1/llm/dashboard` | Savings, hit rate, hourly series and per-model breakdown. |
+| `GET /v1/llm/cache` | Cache contents with each entry's live policy verdict. |
+| `POST /v1/llm/cache/purge` | Manual invalidation, optionally filtered. |
+| `POST /v1/llm/cache/sweep` | Run the invalidation sweeper now. |
+| `DELETE /v1/llm/cache/{entry_id}` | Invalidate one entry. |
+
 ## Registering your own MCP servers
 
 Point the Servers page (or `POST /v1/servers`) at any Streamable-HTTP MCP
@@ -284,6 +398,14 @@ curl -X POST http://localhost:8090/v1/servers \
   before exposing this appliance beyond your laptop.
 - Audit log entries expire after `AUDIT_LOG_RETENTION_HOURS` (default 30
   days) via a Couchbase document TTL.
+- LLM cache events expire after `LLM_CACHE_LOG_RETENTION_HOURS` (default
+  30 days). The savings dashboard is computed from those events, so that
+  setting is also how far back "tokens saved" can look.
+- Cost figures on the LLM Caching dashboard are list-price estimates from
+  the table in `operations-manager/app/llm_cache.py`, not billing data.
+  Edit that table for your own negotiated rates.
+- Caching is most defensible at temperature 0: a deterministic prompt
+  should have a deterministic answer. The default policy sets it there.
 - The hijack pattern bank is heuristic, not proof of malicious intent - it
   is deliberately tuned toward catching real attacks over avoiding every
   false positive, since the cost of a false positive is one click on

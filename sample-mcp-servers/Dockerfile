@@ -2,8 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Bootstrap: append the corporate CA directly onto the trust bundle that's
+# already baked into the base image *before* touching the network - see
+# operations-manager/Dockerfile for why we don't rely on
+# `apt-get install ca-certificates` succeeding first.
 COPY certs/ /usr/local/share/ca-certificates/extra/
 RUN if find /usr/local/share/ca-certificates/extra -name '*.crt' 2>/dev/null | grep -q .; then \
+      cat /usr/local/share/ca-certificates/extra/*.crt >> /etc/ssl/certs/ca-certificates.crt && \
       apt-get update && \
       apt-get install -y --no-install-recommends ca-certificates && \
       update-ca-certificates && \

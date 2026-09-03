@@ -7,13 +7,7 @@ export type Theme = "light" | "dark";
 // wrong theme.
 const STORAGE_KEY = "agent-operations-theme";
 
-function systemPrefersDark(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(prefers-color-scheme: dark)").matches
-  );
-}
+export const DEFAULT_THEME: Theme = "light";
 
 export function getStoredTheme(): Theme | null {
   try {
@@ -24,10 +18,14 @@ export function getStoredTheme(): Theme | null {
   }
 }
 
-// No stored preference yet - light is this appliance's default look, so we
-// only defer to the system preference when it explicitly asks for dark.
+// No stored preference yet - light. The operating system's
+// `prefers-color-scheme` is deliberately not consulted: this is an
+// appliance console that people screenshot, demo and support each other
+// through, and it should look the same on a first visit whatever machine
+// it's opened on. Dark is opt-in via the toggle, and once chosen it
+// persists in localStorage.
 export function getPreferredTheme(): Theme {
-  return getStoredTheme() ?? (systemPrefersDark() ? "dark" : "light");
+  return getStoredTheme() ?? DEFAULT_THEME;
 }
 
 export function applyTheme(theme: Theme) {

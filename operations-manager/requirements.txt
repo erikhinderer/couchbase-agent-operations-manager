@@ -3,5 +3,5 @@ uvicorn[standard]==0.34.0
 requests==2.32.3
 numpy==1.26.4
 couchbase==4.6.2
-mcp==1.27.0
+mcp==1.29.1
 sentence-transformers==3.3.1

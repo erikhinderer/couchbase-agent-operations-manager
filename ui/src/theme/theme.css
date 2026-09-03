@@ -1,4 +1,12 @@
 :root {
+  /* Light is the default, independent of the OS setting - see the
+     bootstrap script in index.html and ui/src/store/theme.ts. Declaring
+     color-scheme keeps the browser's own chrome (scrollbars, select
+     menus, range sliders, focus rings) in step with the app theme
+     instead of following the OS, which is what made native controls
+     render dark inside the light UI on a dark-mode machine. */
+  color-scheme: light;
+
   --bg: #f3f4f6;
   --bg-elevated: #ffffff;
   --sidebar-bg: #ffffff;
@@ -51,6 +59,8 @@
    accent lines and solid-fill buttons don't need this - only text
    sitting on a tinted background does). */
 [data-theme="dark"] {
+  color-scheme: dark;
+
   --bg: #0a0d13;
   --bg-elevated: #10141d;
   --sidebar-bg: #0c0f16;
@@ -167,6 +177,15 @@ code,
   font-size: 17px;
   flex-shrink: 0;
   box-shadow: 0 2px 10px rgba(234, 35, 40, 0.35);
+}
+
+/* The glyph is drawn on the logo's own 24x24 grid, so filling the mark
+   edge to edge reproduces the cup's real size and position inside the
+   official circle - no manual nudging. */
+.brand-mark .couchbase-glyph {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 .brand-name {
@@ -669,6 +688,16 @@ table.data-table {
   border-color: var(--red-border);
 }
 
+.field input[type="range"] {
+  width: 100%;
+  accent-color: var(--teal);
+  margin: 6px 0 2px 0;
+}
+
+.field input[type="range"]:disabled {
+  opacity: 0.45;
+}
+
 .field-hint {
   font-size: 11.5px;
   color: var(--text-faint);
@@ -741,6 +770,82 @@ table.data-table {
 
 .error-note {
   color: var(--red-dim);
+}
+
+/* ------------------------------------------------- catalog server groups */
+
+/* The Tool Catalog is sectioned by server: one card per server, headed by
+   the server's own label and trust status, with its tools inside. The
+   header carries the "can this be reached at all" signal (status dot +
+   trust badge) so a quarantined or unregistered source is obvious before
+   you read a single tool row. */
+.catalog-group {
+  margin-bottom: 16px;
+}
+
+.catalog-group-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.catalog-group-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  width: 14px;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.catalog-group-toggle:hover {
+  color: var(--text);
+}
+
+.catalog-group-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.catalog-group-id {
+  color: var(--text-faint);
+}
+
+.catalog-group-count {
+  margin-left: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.catalog-group-meta {
+  font-size: 12px;
+  color: var(--text-faint);
+  margin: 0 0 12px 24px;
+}
+
+.catalog-group .table-wrap {
+  margin-top: 10px;
+}
+
+.catalog-table {
+  table-layout: fixed;
+  min-width: 780px;
+}
+
+.catalog-table td:first-child {
+  word-break: break-word;
 }
 
 .tag-chip {

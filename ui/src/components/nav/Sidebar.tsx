@@ -3,20 +3,28 @@ import { useEffect, useState } from "react";
 import { api } from "../../api/client";
 import type { HealthResponse } from "../../api/types";
 import { ThemeToggle } from "../common/ThemeToggle";
+import { CouchbaseGlyph } from "../common/CouchbaseLogo";
 
 const NAV_SECTIONS: Array<{
   label: string;
-  items: Array<{ to: string; icon: string; text: string }>;
+  items: Array<{ to: string; icon: string; text: string; exact?: boolean }>;
 }> = [
   {
     label: "Overview",
-    items: [{ to: "/", icon: "▦", text: "Dashboard" }],
+    items: [{ to: "/", icon: "▦", text: "Dashboard", exact: true }],
   },
   {
     label: "Registry",
     items: [
       { to: "/servers", icon: "⌘", text: "MCP Servers" },
       { to: "/catalog", icon: "≡", text: "Tool Catalog" },
+    ],
+  },
+  {
+    label: "LLM Caching",
+    items: [
+      { to: "/llm-caching", icon: "◈", text: "Cache Dashboard", exact: true },
+      { to: "/llm-caching/settings", icon: "⚙", text: "Providers & Policy" },
     ],
   },
   {
@@ -64,7 +72,9 @@ export function Sidebar() {
   return (
     <aside className="sidebar">
       <div className="brand">
-        <div className="brand-mark">C</div>
+        <div className="brand-mark">
+          <CouchbaseGlyph />
+        </div>
         <div className="brand-name">
           Couchbase
           <br />
@@ -80,7 +90,7 @@ export function Sidebar() {
             <NavLink
               key={item.to}
               to={item.to}
-              end={item.to === "/"}
+              end={!!item.exact}
               className={({ isActive }) => `nav-item${isActive ? " active" : ""}`}
             >
               <span className="nav-icon">{item.icon}</span>

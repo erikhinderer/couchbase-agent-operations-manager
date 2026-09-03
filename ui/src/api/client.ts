@@ -3,6 +3,12 @@ import type {
   DashboardResponse,
   Finding,
   HealthResponse,
+  LLMCacheConfig,
+  LLMCacheEntry,
+  LLMCompleteResponse,
+  LLMConfigResponse,
+  LLMDashboardResponse,
+  LLMProvider,
   Role,
   ServerDoc,
   ThreatDetectionResponse,
@@ -89,6 +95,33 @@ export const api = {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({ tool_id: toolId, arguments: args }),
+    }),
+
+  // -- LLM response caching --------------------------------------------
+  llmProviders: () => request<{ providers: LLMProvider[] }>("/v1/llm/providers"),
+  llmConfig: () => request<LLMConfigResponse>("/v1/llm/config"),
+  saveLlmConfig: (config: LLMCacheConfig) =>
+    request<{ config: LLMCacheConfig; config_version: string; entries_invalidated: number }>("/v1/llm/config", {
+      method: "PUT",
+      body: JSON.stringify({ config }),
+    }),
+  llmDashboard: () => request<LLMDashboardResponse>("/v1/llm/dashboard"),
+  llmCacheEntries: (limit = 100) =>
+    request<{ entries: LLMCacheEntry[]; count: number; total_entries: number }>(`/v1/llm/cache?limit=${limit}`),
+  purgeLlmCache: (filter: { provider?: string; model?: string; namespace?: string } = {}) =>
+    request<{ purged: number }>("/v1/llm/cache/purge", { method: "POST", body: JSON.stringify(filter) }),
+  sweepLlmCache: () =>
+    request<{ removed: number; last_sweep_at: string }>("/v1/llm/cache/sweep", { method: "POST" }),
+  deleteLlmCacheEntry: (entryId: string) =>
+    request<{ deleted: boolean }>(`/v1/llm/cache/${encodeURIComponent(entryId)}`, { method: "DELETE" }),
+  llmComplete: (
+    apiKey: string,
+    payload: { prompt: string; provider?: string; model?: string; bypass_cache?: boolean }
+  ) =>
+    request<LLMCompleteResponse>("/v1/llm/complete", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(payload),
     }),
 
   threatDetection: () => request<ThreatDetectionResponse>("/v1/threat-detection"),

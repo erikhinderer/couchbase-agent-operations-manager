@@ -6,10 +6,12 @@
 #      RBAC identity table, and the access audit log
 #   3. Creates primary indexes so the app can run N1QL COUNT()/SELECT queries
 #
-# The Search (FTS) vector index itself is created by the operations-manager on
-# startup (see ensure_search_index() in operations-manager/app/couchbase_client.py)
-# since it depends on the embedding model's vector dimension. This script
-# only prepares the cluster/bucket/collections.
+# The two Search (FTS) vector indexes - one over the tool catalog, one over
+# the LLM response cache - are created by the operations-manager on startup
+# (ensure_search_index() / ensure_llm_cache_index() in
+# operations-manager/app/couchbase_client.py) since both depend on the
+# embedding model's vector dimension. This script only prepares the
+# cluster/bucket/collections.
 #
 # Safe to re-run: every mutating step tolerates "already exists" failures.
 
@@ -71,7 +73,14 @@ curl -s -u "${CB_USER}:${CB_PASS}" -X POST \
 #             status, risk level
 # identities- API keys mapped to an RBAC role
 # access_log- append-only audit trail of every discovery/invoke decision
-for COLLECTION in servers tools identities access_log; do
+# llm_cache - cached LLM completions for agents: prompt hash + embedding,
+#             response, token/cost accounting, hit counters (see
+#             operations-manager/app/llm_cache.py)
+# llm_cache_log - append-only hit/miss/bypass event stream the LLM token
+#             savings dashboard is computed from
+# settings  - user-editable runtime policy documents (currently
+#             settings::llm_cache, written from the LLM Caching page)
+for COLLECTION in servers tools identities access_log llm_cache llm_cache_log settings; do
   echo "[couchbase-init] Creating collection '${CB_SCOPE}.${COLLECTION}'..."
   curl -s -u "${CB_USER}:${CB_PASS}" -X POST \
     http://${CB_HOST}:8091/pools/default/buckets/${CB_BUCKET}/scopes/${CB_SCOPE}/collections \
@@ -82,7 +91,7 @@ echo "[couchbase-init] Waiting for collections to propagate to the Query service
 sleep 8
 
 echo "[couchbase-init] Creating primary indexes for N1QL support..."
-for COLLECTION in servers tools identities access_log; do
+for COLLECTION in servers tools identities access_log llm_cache llm_cache_log settings; do
   curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
     -d "statement=CREATE PRIMARY INDEX IF NOT EXISTS ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`${COLLECTION}\`" > /dev/null || true
 done

@@ -18,6 +18,7 @@ background monitor that re-scans the catalog on a timer - see
 app/hijack_detection.py).
 """
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -27,7 +28,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app import hijack_detection, insights, mcp_client
+from app import hijack_detection, insights, llm_cache, mcp_client
 from app.catalog_ingest import ingest_all, ingest_server, rescan_all_tools, seed_servers
 from app.couchbase_client import CouchbaseStore
 from app.embeddings import ToolEmbeddings
@@ -39,6 +40,9 @@ from config import (
     HIJACK_CHAIN_WINDOW_SECONDS,
     HIJACK_SCAN_INTERVAL_MINUTES,
     INSIGHTS_LOOKBACK_ENTRIES,
+    LLM_API_KEYS,
+    LLM_CACHE_DEFAULTS,
+    LLM_CACHE_LOOKBACK_ENTRIES,
     SAMPLE_MCP_SERVERS_BASE_URL,
     SEED_API_KEYS,
 )
@@ -57,6 +61,16 @@ store = CouchbaseStore()
 embeddings: ToolEmbeddings | None = None
 ready = False
 last_hijack_scan_at: str | None = None
+
+# LLM response caching for agents (see app/llm_cache.py). The policy is
+# user-editable from the LLM Caching page and persisted in Couchbase, so it
+# is loaded on startup and kept in memory for the hot path - a cache lookup
+# should never cost an extra round-trip just to read its own settings.
+LLM_CACHE_SETTINGS_DOC = "settings::llm_cache"
+llm_config: dict = llm_cache.normalize_config(LLM_CACHE_DEFAULTS)
+llm_config_version: str = llm_cache.config_fingerprint(llm_config)
+llm_catalog_version: str = ""
+last_llm_sweep_at: str | None = None
 
 
 @app.on_event("startup")
@@ -83,6 +97,10 @@ async def startup():
 
         asyncio.create_task(hijack_monitor_loop())
 
+        await load_llm_config()
+        await refresh_catalog_version()
+        asyncio.create_task(llm_cache_sweeper_loop())
+
     ready = True
     logger.info("Operations manager ready (couchbase_connected=%s)", store.connected)
 
@@ -106,6 +124,99 @@ async def hijack_monitor_loop():
                 logger.info("Hijack monitor: %d tool(s) changed trust/hijack status on this pass", changed)
         except Exception as exc:  # noqa: BLE001
             logger.error("Hijack monitor pass failed: %s", exc)
+
+
+async def load_llm_config():
+    """Read the stored cache policy, falling back to the .env bootstrap
+    defaults the first time this appliance ever starts."""
+    global llm_config, llm_config_version
+    stored = await store.get_setting(LLM_CACHE_SETTINGS_DOC)
+    llm_config = llm_cache.normalize_config(stored.get("config") if stored else LLM_CACHE_DEFAULTS)
+    llm_config_version = llm_cache.config_fingerprint(llm_config)
+    if not stored:
+        await save_llm_config(llm_config)
+    logger.info(
+        "LLM cache policy loaded (provider=%s model=%s ttl=%ss semantic=%s)",
+        llm_config["provider"], llm_config["model"], llm_config["ttl_seconds"], llm_config["semantic_enabled"],
+    )
+
+
+async def save_llm_config(cfg: dict):
+    global llm_config, llm_config_version
+    llm_config = llm_cache.normalize_config(cfg)
+    llm_config_version = llm_cache.config_fingerprint(llm_config)
+    await store.upsert_setting(
+        LLM_CACHE_SETTINGS_DOC,
+        {
+            "doc_type": "settings",
+            "setting_id": "llm_cache",
+            "config": llm_config,
+            "config_version": llm_config_version,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
+
+
+async def refresh_catalog_version() -> str:
+    """A fingerprint of the vetted tool catalog. Only consulted when the
+    `invalidate_on_catalog_change` policy is on - an agent's answer can
+    depend on which tools it was allowed to see, so a catalog change is a
+    legitimate reason to stop reusing an answer produced before it."""
+    global llm_catalog_version
+    try:
+        tools = await store.list_tools()
+        material = "|".join(sorted(f"{t.get('tool_id')}:{t.get('trust_status')}" for t in tools))
+        llm_catalog_version = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not compute catalog version: %s", exc)
+    return llm_catalog_version
+
+
+async def llm_cache_sweeper_loop():
+    """Enforces the parts of the invalidation policy that nothing else would
+    notice on its own: entries whose TTL, reuse limit, model, config or
+    catalog fingerprint has gone stale, and overflow past `max_entries`
+    under the configured eviction policy.
+
+    Couchbase document expiry already reclaims TTL'd entries, so this is
+    belt-and-braces for TTL - but it is the *only* thing that applies the
+    other four rules to entries nobody happens to read again."""
+    global last_llm_sweep_at
+    while True:
+        await asyncio.sleep(max(60, int(llm_config.get("sweep_interval_minutes", 5)) * 60))
+        if not store.connected:
+            continue
+        try:
+            removed = await sweep_llm_cache()
+            last_llm_sweep_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            if removed:
+                logger.info("LLM cache sweeper removed %d entr(ies) on this pass", removed)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("LLM cache sweep failed: %s", exc)
+
+
+async def sweep_llm_cache() -> int:
+    """One sweeper pass. Returns how many entries were removed."""
+    await refresh_catalog_version()
+    entries = await store.list_cache_entries(limit=10000)
+    now = time.time()
+    removed = 0
+    survivors = []
+    for entry in entries:
+        state, _reason = llm_cache.evaluate_entry(
+            entry, llm_config, now=now,
+            config_version=llm_config_version, catalog_version=llm_catalog_version,
+        )
+        if state == "invalid":
+            if await store.delete_cache_entry(entry["entry_id"]):
+                removed += 1
+        else:
+            survivors.append(entry)
+
+    for entry_id in llm_cache.select_evictions(survivors, llm_config):
+        if await store.delete_cache_entry(entry_id):
+            removed += 1
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -468,4 +579,412 @@ async def dashboard():
         "action_breakdown": actions,
         "hourly_volume": hourly,
         "top_findings": findings[:5],
+    }
+
+
+# ---------------------------------------------------------------------------
+# LLM response caching for agents
+# ---------------------------------------------------------------------------
+# Same shape as the tool gateway: the agent authenticates here, the
+# operations manager decides, and every decision is recorded. The difference
+# is that the decision is "has this already been answered?" - and when the
+# answer is yes, no tokens leave the building.
+class LLMCompleteRequest(BaseModel):
+    prompt: str
+    provider: str | None = None
+    model: str | None = None
+    namespace: str | None = None
+    bypass_cache: bool = False
+    params: dict = Field(default_factory=dict)
+
+
+class LLMConfigRequest(BaseModel):
+    config: dict
+
+
+class PurgeCacheRequest(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    namespace: str | None = None
+
+
+@app.get("/v1/llm/providers")
+async def llm_providers():
+    """The selectable LLMs - Claude, ChatGPT and Gemini - with their models
+    and list-price estimates, plus whether each one has an API key
+    configured. Keys themselves are never returned."""
+    return {"providers": llm_cache.provider_catalog(LLM_API_KEYS)}
+
+
+@app.get("/v1/llm/config")
+async def get_llm_config():
+    return {
+        "config": llm_config,
+        "config_version": llm_config_version,
+        "defaults": llm_cache.DEFAULT_CACHE_CONFIG,
+        "cache_scopes": list(llm_cache.CACHE_SCOPES),
+        "eviction_policies": list(llm_cache.EVICTION_POLICIES),
+        "last_sweep_at": last_llm_sweep_at,
+        "cached_entries": await store.count_cache_entries(),
+    }
+
+
+@app.put("/v1/llm/config")
+async def put_llm_config(req: LLMConfigRequest):
+    """Save the cache policy. Every value is re-validated server-side (see
+    llm_cache.normalize_config) - the setup form is a convenience, not the
+    boundary.
+
+    If the change moves the config fingerprint and `invalidate_on_config_change`
+    is on, an immediate sweep runs so the user sees the invalidation they just
+    asked for rather than waiting for the next timer tick."""
+    previous_version = llm_config_version
+    previous_model = llm_config.get("model")
+    await save_llm_config(req.config)
+
+    config_changed = llm_config.get("invalidate_on_config_change") and llm_config_version != previous_version
+    model_changed = llm_config.get("invalidate_on_model_change") and llm_config.get("model") != previous_model
+    invalidated = await sweep_llm_cache() if (config_changed or model_changed) else 0
+    return {
+        "config": llm_config,
+        "config_version": llm_config_version,
+        "entries_invalidated": invalidated,
+    }
+
+
+@app.post("/v1/llm/complete")
+async def llm_complete(req: LLMCompleteRequest, authorization: str | None = Header(default=None)):
+    role, subject = await authenticate(authorization)
+    if not req.prompt or not req.prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt is required")
+    if not store.connected:
+        raise HTTPException(status_code=503, detail="Operations manager not fully initialized yet")
+
+    cfg = dict(llm_config)
+    if req.namespace:
+        cfg["namespace"] = req.namespace
+        cfg = llm_cache.normalize_config(cfg)
+
+    provider = req.provider or cfg["provider"]
+    if provider not in llm_cache.PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}' (expected one of {list(llm_cache.PROVIDERS)})")
+    model = req.model or (cfg["model"] if provider == cfg["provider"] else llm_cache.PROVIDERS[provider]["default_model"])
+    if model not in llm_cache.PROVIDERS[provider]["models"]:
+        raise HTTPException(status_code=400, detail=f"Model '{model}' is not offered by provider '{provider}'")
+
+    start = time.time()
+    scope = llm_cache.scope_key(cfg, role, subject)
+    eid = llm_cache.entry_id(cfg, provider, model, req.prompt, req.params, scope)
+
+    bypass_reason = None
+    if not cfg.get("enabled"):
+        bypass_reason = "caching is disabled in the current policy"
+    elif req.bypass_cache:
+        bypass_reason = "caller requested bypass_cache"
+    else:
+        bypass_reason = llm_cache.is_bypassed(req.prompt, cfg, role)
+
+    # ---- read path -------------------------------------------------------
+    if not bypass_reason:
+        hit, similarity, invalidation = await _lookup_cache(cfg, provider, model, scope, eid, req.prompt)
+        if hit:
+            latency_ms = int((time.time() - start) * 1000)
+            updated = await _record_cache_hit(hit, cfg, similarity is not None)
+            saved_ms = max(0, int(hit.get("origin_latency_ms") or 0) - latency_ms)
+            outcome = "hit_semantic" if similarity is not None else "hit_exact"
+            await store.log_llm_event({
+                "doc_type": "llm_cache_event",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "outcome": outcome,
+                "provider": provider,
+                "model": model,
+                "role": role,
+                "subject": subject,
+                "entry_id": hit["entry_id"],
+                "namespace": cfg["namespace"],
+                "scope_key": scope,
+                "similarity": similarity,
+                "prompt_preview": req.prompt.strip()[:240],
+                "prompt_tokens": hit.get("prompt_tokens", 0),
+                "completion_tokens": hit.get("completion_tokens", 0),
+                "total_tokens": hit.get("total_tokens", 0),
+                "tokens_saved": hit.get("total_tokens", 0),
+                "cost_usd": 0.0,
+                "cost_saved_usd": hit.get("cost_usd", 0.0),
+                "latency_ms": latency_ms,
+                "latency_saved_ms": saved_ms,
+                "reason": f"served from cache ({outcome.replace('hit_', '')} match)",
+            })
+            return {
+                "provider": provider,
+                "model": model,
+                "role": role,
+                "response": hit.get("response", ""),
+                "cache": {
+                    "status": outcome,
+                    "entry_id": hit["entry_id"],
+                    "similarity": similarity,
+                    "hit_count": updated,
+                    "created_at": hit.get("created_at"),
+                    "reason": invalidation,
+                },
+                "usage": {
+                    "prompt_tokens": hit.get("prompt_tokens", 0),
+                    "completion_tokens": hit.get("completion_tokens", 0),
+                    "total_tokens": hit.get("total_tokens", 0),
+                },
+                "cost_usd": 0.0,
+                "tokens_saved": hit.get("total_tokens", 0),
+                "cost_saved_usd": hit.get("cost_usd", 0.0),
+                "latency_ms": latency_ms,
+                "stub": bool(hit.get("stub")),
+            }
+
+    # ---- miss path -------------------------------------------------------
+    try:
+        result = await asyncio.to_thread(llm_cache.call_provider, provider, model, req.prompt, cfg, LLM_API_KEYS)
+    except Exception as exc:  # noqa: BLE001
+        latency_ms = int((time.time() - start) * 1000)
+        await store.log_llm_event({
+            "doc_type": "llm_cache_event",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "outcome": "error", "provider": provider, "model": model, "role": role, "subject": subject,
+            "namespace": cfg["namespace"], "scope_key": scope,
+            "prompt_preview": req.prompt.strip()[:240],
+            "latency_ms": latency_ms, "reason": str(exc)[:400],
+        })
+        raise HTTPException(status_code=502, detail=f"{llm_cache.PROVIDERS[provider]['label']} call failed: {exc}") from exc
+
+    latency_ms = int((time.time() - start) * 1000)
+    prompt_tokens = int(result["prompt_tokens"])
+    completion_tokens = int(result["completion_tokens"])
+    total_tokens = prompt_tokens + completion_tokens
+    cost_usd = llm_cache.estimate_cost_usd(model, prompt_tokens, completion_tokens)
+
+    if not bypass_reason:
+        await _store_cache_entry(
+            eid, cfg, provider, model, scope, req.prompt, result,
+            prompt_tokens, completion_tokens, cost_usd, latency_ms,
+            override=(provider != cfg["provider"] or model != cfg["model"]),
+        )
+
+    await store.log_llm_event({
+        "doc_type": "llm_cache_event",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "outcome": "bypass" if bypass_reason else "miss",
+        "provider": provider, "model": model, "role": role, "subject": subject,
+        "entry_id": None if bypass_reason else eid,
+        "namespace": cfg["namespace"], "scope_key": scope, "similarity": None,
+        "prompt_preview": req.prompt.strip()[:240],
+        "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens,
+        "tokens_saved": 0, "cost_usd": cost_usd, "cost_saved_usd": 0.0,
+        "latency_ms": latency_ms, "latency_saved_ms": 0,
+        "reason": bypass_reason or "no cached answer - called the provider and stored the result",
+    })
+
+    return {
+        "provider": provider,
+        "model": model,
+        "role": role,
+        "response": result["text"],
+        "cache": {
+            "status": "bypass" if bypass_reason else "miss",
+            "entry_id": None if bypass_reason else eid,
+            "similarity": None,
+            "hit_count": 0,
+            "created_at": None,
+            "reason": bypass_reason,
+        },
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
+        "cost_usd": cost_usd,
+        "tokens_saved": 0,
+        "cost_saved_usd": 0.0,
+        "latency_ms": latency_ms,
+        "stub": bool(result.get("stub")),
+    }
+
+
+async def _lookup_cache(cfg: dict, provider: str, model: str, scope: str, eid: str, prompt: str):
+    """Exact first (one KV get on a deterministic ID), then the semantic
+    fallback if it's enabled. Anything the policy says is invalid is deleted
+    on the spot rather than left to the sweeper - a read that noticed the
+    problem is the cheapest place to fix it."""
+    entry = await store.get_cache_entry(eid)
+    if entry:
+        state, reason = llm_cache.evaluate_entry(
+            entry, cfg, config_version=llm_config_version, catalog_version=llm_catalog_version
+        )
+        if state in ("fresh", "stale"):
+            return entry, None, reason
+        await store.delete_cache_entry(eid)
+
+    if not cfg.get("semantic_enabled") or embeddings is None:
+        return None, None, None
+
+    try:
+        vector = embeddings.embed(prompt)
+    except ValueError:
+        return None, None, None
+
+    candidates = await store.semantic_cache_lookup(
+        provider, model, scope, cfg["namespace"], vector, top_k=int(cfg["semantic_candidates"])
+    )
+    threshold = float(cfg["similarity_threshold"])
+    for candidate in candidates:
+        if candidate["similarity"] < threshold:
+            break
+        entry = await store.get_cache_entry(candidate["entry_id"])
+        if not entry:
+            continue
+        state, reason = llm_cache.evaluate_entry(
+            entry, cfg, config_version=llm_config_version, catalog_version=llm_catalog_version
+        )
+        if state in ("fresh", "stale"):
+            return entry, candidate["similarity"], reason
+        await store.delete_cache_entry(candidate["entry_id"])
+    return None, None, None
+
+
+async def _record_cache_hit(entry: dict, cfg: dict, semantic: bool) -> int:
+    """Bump the hit counters and the running savings total on the entry.
+
+    Re-written with the *remaining* TTL as its expiry, never a fresh one: a
+    popular entry must still age out on schedule, otherwise a hot prompt
+    would never be re-verified against the provider."""
+    now = time.time()
+    entry["hit_count"] = int(entry.get("hit_count") or 0) + 1
+    entry["last_hit_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if semantic:
+        entry["semantic_hits"] = int(entry.get("semantic_hits") or 0) + 1
+    else:
+        entry["exact_hits"] = int(entry.get("exact_hits") or 0) + 1
+    entry["tokens_saved"] = int(entry.get("tokens_saved") or 0) + int(entry.get("total_tokens") or 0)
+    entry["cost_saved_usd"] = round(float(entry.get("cost_saved_usd") or 0.0) + float(entry.get("cost_usd") or 0.0), 6)
+
+    ttl = int(cfg.get("ttl_seconds") or 0)
+    remaining = 0
+    if ttl:
+        age = now - llm_cache.parse_timestamp(entry.get("created_at"))
+        remaining = max(1, int(ttl + int(cfg.get("stale_while_revalidate_seconds") or 0) - age))
+    await store.upsert_cache_entry(entry["entry_id"], entry, ttl_seconds=remaining)
+    return entry["hit_count"]
+
+
+async def _store_cache_entry(
+    eid, cfg, provider, model, scope, prompt, result,
+    prompt_tokens, completion_tokens, cost_usd, latency_ms, override=False,
+):
+    embedding = None
+    if cfg.get("semantic_enabled") and embeddings is not None:
+        try:
+            embedding = embeddings.embed(prompt)
+        except ValueError:
+            embedding = None
+
+    text = result["text"]
+    doc = {
+        "doc_type": "llm_cache_entry",
+        "entry_id": eid,
+        "provider": provider,
+        "model": model,
+        "scope_key": scope,
+        "namespace": cfg["namespace"],
+        "prompt": prompt,
+        "prompt_preview": prompt.strip()[:240],
+        "response": text,
+        "response_preview": (text or "").strip()[:240],
+        "embedding": embedding,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "cost_usd": cost_usd,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "last_hit_at": None,
+        "hit_count": 0,
+        "exact_hits": 0,
+        "semantic_hits": 0,
+        "tokens_saved": 0,
+        "cost_saved_usd": 0.0,
+        "origin_latency_ms": latency_ms,
+        "config_version": llm_config_version,
+        "catalog_version": llm_catalog_version,
+        # True when this call named a provider/model other than the policy's
+        # default. Such entries survive a change to the selected model - see
+        # llm_cache.evaluate_entry.
+        "override": bool(override),
+        "stub": bool(result.get("stub")),
+    }
+    ttl = int(cfg.get("ttl_seconds") or 0)
+    expiry = ttl + int(cfg.get("stale_while_revalidate_seconds") or 0) if ttl else 0
+    await store.upsert_cache_entry(eid, doc, ttl_seconds=expiry)
+
+
+@app.get("/v1/llm/cache")
+async def list_llm_cache(limit: int = 100):
+    """Cache contents with each entry's live policy verdict attached, so the
+    table shows what the gateway would actually do with it right now."""
+    entries = await store.list_cache_entries(limit=min(limit, 500))
+    now = time.time()
+    for entry in entries:
+        state, reason = llm_cache.evaluate_entry(
+            entry, llm_config, now=now,
+            config_version=llm_config_version, catalog_version=llm_catalog_version,
+        )
+        entry["state"] = state
+        entry["state_reason"] = reason
+        entry["age_seconds"] = int(max(0, now - llm_cache.parse_timestamp(entry.get("created_at"))))
+    return {"entries": entries, "count": len(entries), "total_entries": await store.count_cache_entries()}
+
+
+@app.post("/v1/llm/cache/purge")
+async def purge_llm_cache(req: PurgeCacheRequest):
+    """Manual invalidation: everything, or narrowed to one provider, model
+    or namespace."""
+    removed = await store.purge_cache(provider=req.provider, model=req.model, namespace=req.namespace)
+    return {"purged": removed, "provider": req.provider, "model": req.model, "namespace": req.namespace}
+
+
+@app.post("/v1/llm/cache/sweep")
+async def sweep_llm_cache_route():
+    """Run the invalidation sweeper now instead of waiting for the timer."""
+    global last_llm_sweep_at
+    removed = await sweep_llm_cache()
+    last_llm_sweep_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return {"removed": removed, "last_sweep_at": last_llm_sweep_at}
+
+
+@app.delete("/v1/llm/cache/{entry_id:path}")
+async def delete_llm_cache_entry(entry_id: str):
+    if not await store.delete_cache_entry(entry_id):
+        raise HTTPException(status_code=404, detail="Cache entry not found")
+    return {"deleted": True, "entry_id": entry_id}
+
+
+@app.get("/v1/llm/dashboard")
+async def llm_dashboard():
+    events = await store.recent_llm_events(limit=LLM_CACHE_LOOKBACK_ENTRIES)
+    data = llm_cache.build_dashboard(events, buckets=12)
+    provider_spec = llm_cache.PROVIDERS[llm_config["provider"]]
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "events_examined": len(events),
+        "enabled": llm_config["enabled"],
+        "provider": llm_config["provider"],
+        "provider_label": provider_spec["label"],
+        "model": llm_config["model"],
+        "api_key_configured": bool((LLM_API_KEYS.get(llm_config["provider"]) or "").strip()),
+        "semantic_enabled": llm_config["semantic_enabled"],
+        "similarity_threshold": llm_config["similarity_threshold"],
+        "ttl_seconds": llm_config["ttl_seconds"],
+        "cached_entries": await store.count_cache_entries(),
+        "max_entries": llm_config["max_entries"],
+        "last_sweep_at": last_llm_sweep_at,
+        "summary": data["summary"],
+        "hourly": data["hourly"],
+        "model_breakdown": data["model_breakdown"],
+        "recent_events": events[:50],
     }

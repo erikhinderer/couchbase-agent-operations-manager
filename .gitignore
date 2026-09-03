@@ -3,3 +3,17 @@ certs/
 operations-manager/certs/
 sample-mcp-servers/certs/
 ui/certs/
+
+# Python bytecode from running the operations manager outside Docker.
+__pycache__/
+*.pyc
+
+# Local UI dev/build artifacts (the ui image builds these inside Docker).
+ui/node_modules/
+ui/dist/
+ui/tsconfig.tsbuildinfo
+ui/vite.config.ts.timestamp-*.mjs
+
+# Real environment file - holds provider API keys (ANTHROPIC_API_KEY etc.).
+# Commit .env.example instead.
+.env

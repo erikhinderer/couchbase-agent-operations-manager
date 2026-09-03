@@ -3,22 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Couchbase Agent Operations Manager</title>
     <script>
       // Sets data-theme before first paint so there's no flash of the
-      // wrong theme. Light is the default look - only dark needs to be
-      // requested explicitly. Keep the storage key and fallback logic
-      // in sync with ui/src/store/theme.ts.
+      // wrong theme. Light is this appliance's default, full stop - the
+      // operating system's dark preference is deliberately NOT consulted,
+      // so a first visit looks the same on every machine. Dark is only
+      // ever applied when someone has explicitly asked for it with the
+      // toggle. Keep the storage key and fallback logic in sync with
+      // ui/src/store/theme.ts.
       (function () {
         try {
           var stored = localStorage.getItem("agent-operations-theme");
-          var theme =
-            stored === "light" || stored === "dark"
-              ? stored
-              : window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
-              ? "dark"
-              : "light";
-          document.documentElement.dataset.theme = theme;
+          document.documentElement.dataset.theme = stored === "dark" ? "dark" : "light";
         } catch (e) {
           document.documentElement.dataset.theme = "light";
         }

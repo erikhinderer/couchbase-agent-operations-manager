@@ -3,6 +3,8 @@ import { Sidebar } from "./components/nav/Sidebar";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ServersPage } from "./pages/ServersPage";
 import { CatalogPage } from "./pages/CatalogPage";
+import { LLMCachePage } from "./pages/LLMCachePage";
+import { LLMCacheSettingsPage } from "./pages/LLMCacheSettingsPage";
 import { RolesPage } from "./pages/RolesPage";
 import { ThreatDetectionPage } from "./pages/ThreatDetectionPage";
 import { InsightsPage } from "./pages/InsightsPage";
@@ -18,6 +20,8 @@ export default function App() {
           <Route path="/" element={<DashboardPage />} />
           <Route path="/servers" element={<ServersPage />} />
           <Route path="/catalog" element={<CatalogPage />} />
+          <Route path="/llm-caching" element={<LLMCachePage />} />
+          <Route path="/llm-caching/settings" element={<LLMCacheSettingsPage />} />
           <Route path="/roles" element={<RolesPage />} />
           <Route path="/threat-detection" element={<ThreatDetectionPage />} />
           <Route path="/insights" element={<InsightsPage />} />

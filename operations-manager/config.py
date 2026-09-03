@@ -18,7 +18,11 @@ COUCHBASE_CONFIG = {
     "tools_collection": "tools",
     "identities_collection": "identities",
     "access_log_collection": "access_log",
+    "llm_cache_collection": "llm_cache",
+    "llm_cache_log_collection": "llm_cache_log",
+    "settings_collection": "settings",
     "tools_index": os.getenv("COUCHBASE_TOOLS_INDEX", "tools_rbac_vector_index"),
+    "llm_cache_index": os.getenv("COUCHBASE_LLM_CACHE_INDEX", "llm_cache_vector_index"),
     "search_host": os.getenv("COUCHBASE_SEARCH_HOST", "localhost"),
     "search_port": int(os.getenv("COUCHBASE_SEARCH_PORT", "8094")),
 }
@@ -67,3 +71,39 @@ HIJACK_SCAN_INTERVAL_MINUTES = int(os.getenv("HIJACK_SCAN_INTERVAL_MINUTES", "5"
 HIJACK_CHAIN_WINDOW_SECONDS = int(os.getenv("HIJACK_CHAIN_WINDOW_SECONDS", "120"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+
+# ---------------------------------------------------------------------------
+# LLM response caching for agents (see app/llm_cache.py)
+# ---------------------------------------------------------------------------
+# Provider API keys. Every one of these is optional: a provider with no key
+# configured still answers on a cache miss, from a clearly-labelled offline
+# stub, so the caching gateway and its savings dashboard work on first boot
+# with no outbound network access. Configure a key to proxy real calls.
+LLM_API_KEYS = {
+    "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
+    "openai": os.getenv("OPENAI_API_KEY", ""),
+    "google": os.getenv("GEMINI_API_KEY", ""),
+}
+
+# Runtime cache policy lives in Couchbase (settings::llm_cache) because it is
+# user-editable from the LLM Caching page. These are only the bootstrap
+# defaults applied the first time the appliance starts with an empty
+# settings collection - after that, the stored document wins.
+LLM_CACHE_DEFAULTS = {
+    "enabled": os.getenv("LLM_CACHE_ENABLED", "true").lower() != "false",
+    "provider": os.getenv("LLM_CACHE_PROVIDER", "anthropic"),
+    "model": os.getenv("LLM_CACHE_MODEL", "claude-sonnet-4-5"),
+    "ttl_seconds": int(os.getenv("LLM_CACHE_TTL_SECONDS", "3600")),
+    "max_entries": int(os.getenv("LLM_CACHE_MAX_ENTRIES", "5000")),
+    "similarity_threshold": float(os.getenv("LLM_CACHE_SIMILARITY_THRESHOLD", "0.94")),
+    "semantic_enabled": os.getenv("LLM_CACHE_SEMANTIC_ENABLED", "true").lower() != "false",
+}
+
+# How long a cache hit/miss event survives before Couchbase expires it. The
+# savings dashboard is computed from these events, so this is also how far
+# back "tokens saved" can look.
+LLM_CACHE_LOG_RETENTION_HOURS = int(os.getenv("LLM_CACHE_LOG_RETENTION_HOURS", str(24 * 30)))
+
+# How many recent cache events the savings dashboard aggregates over.
+LLM_CACHE_LOOKBACK_ENTRIES = int(os.getenv("LLM_CACHE_LOOKBACK_ENTRIES", "2000"))

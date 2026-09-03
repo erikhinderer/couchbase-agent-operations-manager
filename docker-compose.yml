@@ -115,6 +115,20 @@ services:
       AUDIT_LOG_RETENTION_HOURS: ${AUDIT_LOG_RETENTION_HOURS:-720}
       HIJACK_SCAN_INTERVAL_MINUTES: ${HIJACK_SCAN_INTERVAL_MINUTES:-5}
       HIJACK_CHAIN_WINDOW_SECONDS: ${HIJACK_CHAIN_WINDOW_SECONDS:-120}
+      # LLM response caching for agents. Every provider key is optional -
+      # without one, a cache miss is answered by a labelled offline stub so
+      # the feature is demoable with no egress.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      LLM_CACHE_ENABLED: ${LLM_CACHE_ENABLED:-true}
+      LLM_CACHE_PROVIDER: ${LLM_CACHE_PROVIDER:-anthropic}
+      LLM_CACHE_MODEL: ${LLM_CACHE_MODEL:-claude-sonnet-4-5}
+      LLM_CACHE_TTL_SECONDS: ${LLM_CACHE_TTL_SECONDS:-3600}
+      LLM_CACHE_MAX_ENTRIES: ${LLM_CACHE_MAX_ENTRIES:-5000}
+      LLM_CACHE_SEMANTIC_ENABLED: ${LLM_CACHE_SEMANTIC_ENABLED:-true}
+      LLM_CACHE_SIMILARITY_THRESHOLD: ${LLM_CACHE_SIMILARITY_THRESHOLD:-0.94}
+      LLM_CACHE_LOG_RETENTION_HOURS: ${LLM_CACHE_LOG_RETENTION_HOURS:-720}
       LOG_LEVEL: INFO
     volumes:
       - hf-cache:/root/.cache/huggingface
