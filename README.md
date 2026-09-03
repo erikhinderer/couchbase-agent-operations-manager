@@ -1,7 +1,9 @@
 # Couchbase Agent Operations Manager
 
+<img width="1728" height="963" alt="image" src="https://github.com/user-attachments/assets/7e06b5eb-61b3-486d-ba64-eb91482712bc" />
+
 A Dockerized appliance that uses **Couchbase as a centralized, secure MCP
-tool database**: MCP tool definitions are embedded and stored in Couchbase,
+tool database and LLM Caching Service**: MCP tool definitions are embedded and stored in Couchbase,
 and access to them is controlled with **RBAC combined with Couchbase Vector
 Search pre-filtering** - a single Search (FTS) request that narrows the
 candidate tool set by role and trust status *before/alongside* ranking by
