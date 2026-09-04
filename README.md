@@ -61,15 +61,15 @@ what the caching actually saved.
                      ┌─────────────────────────────────────────────┐
   Your AI agent  ───▶│  Couchbase Agent Operations Manager (API)   │
   (or the bundled    │  - authenticates callers (API key -> role)  │
-   Agent Tool Audit) │  - discover: RBAC + vector Search pre-filter│──▶ your real
-                     │  - invoke: re-checked, then proxied         │    MCP servers
-                     └─────────────────────────────────────────────┘    (registered
-                                          │                              & trusted)
+   Agent Tool Audit) │  - discover: RBAC + vector Search pre-filter│
+                     │  - invoke: re-checked, then proxied         │
+                     └─────────────────────────────────────────────┘
+                                          │
                                           ▼
-                                    ┌───────────┐
-                                    │ Couchbase │  servers / tools /
-                                    │           │  agent_memory (conversational /
-                                    │           │    profile / semantic) /
+                   your real        ┌───────────┐
+                   MCP servers  ───▶│ Couchbase │  servers / tools /
+                   (registered      │           │  agent_memory (conversational /
+                    & trusted)      │           │    profile / semantic) /
                                     │           │  identities / access_log
                                     │           │  llm_cache / llm_cache_log
                                     └───────────┘
