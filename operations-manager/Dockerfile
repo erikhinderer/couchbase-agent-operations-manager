@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -44,11 +45,13 @@ RUN mkdir -p /app/tls && \
 # read-timeout can trip on a slow or corporate-proxy-inspected
 # connection mid-download, well before the transfer has actually
 # stalled - it just retries silently instead of failing the build.
-RUN pip install --no-cache-dir --default-timeout=100 --retries 5 \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=100 --retries 5 \
     torch --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --default-timeout=100 --retries 5 -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=100 --retries 5 -r requirements.txt
 
 COPY config.py .
 COPY app ./app

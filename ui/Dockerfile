@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # --- build stage -----------------------------------------------------------
 FROM node:22-alpine AS build
 WORKDIR /app
@@ -17,8 +18,15 @@ RUN if find /usr/local/share/ca-certificates/extra -name '*.crt' 2>/dev/null | g
     fi
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
-COPY package.json ./
-RUN npm install
+# package-lock.json travels with package.json so npm can install from the
+# lockfile directly (npm ci) instead of re-resolving the whole dependency
+# graph against the registry - fewer registry round trips, which matters a
+# lot when every one of them goes through a TLS-inspecting corporate proxy.
+# The cache mount persists downloaded tarballs across builds so a rebuild
+# (e.g. after a source change that doesn't touch package.json) doesn't
+# re-download packages it already has.
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
 
 COPY . .
 RUN npm run build

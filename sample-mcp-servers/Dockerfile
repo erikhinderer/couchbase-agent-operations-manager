@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -21,8 +22,12 @@ ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Cache mount persists downloaded wheels across builds/services (see
+# operations-manager/Dockerfile) so rebuilds don't re-download this over
+# and over through the corporate proxy.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --default-timeout=100 --retries 5 -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=100 --retries 5 -r requirements.txt
 
 COPY app ./app
 
