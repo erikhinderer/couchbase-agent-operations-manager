@@ -1,6 +1,6 @@
 # Couchbase Agent Operations Manager
 
-<img width="3456" height="1926" alt="image" src="https://github.com/user-attachments/assets/b936c5cc-f2f2-48ed-84e9-cd54653366d3" />
+<img width="3456" height="2098" alt="image" src="https://github.com/user-attachments/assets/bec71859-ce6b-4482-94e9-ec72525286fb" />
 
 A Dockerized appliance that uses **Couchbase as a centralized, secure MCP
 tool database and LLM Caching Service**: MCP tool definitions are embedded and stored in Couchbase,
