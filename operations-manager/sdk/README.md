@@ -27,13 +27,16 @@ Requires Python 3.8+ and `requests`.
 ## TLS
 
 The bundled Docker Compose stack serves HTTPS everywhere (dashboard and
-API) with a self-signed certificate baked in by default - see the repo
-README and `docker-compose.yml` for how to swap in a real one.
-`AOMClient` verifies certificates by default (`verify=True`), which
-rejects that self-signed cert; pass `verify=False` (as the examples
-below do, via `AOM_VERIFY_SSL=false`) until you've installed a real
-certificate, or point `verify` at the exported cert file instead of
-disabling verification entirely.
+API) with a self-signed certificate baked in by default. An admin can
+install a real one from the appliance's dashboard under Settings -> HTTPS
+Certificate, with no file changes needed - see the "HTTPS / TLS" section
+of the main `couchbase-agent-operations-manager` repo's README for that
+page and the manual (bind-mount) alternative. `AOMClient` verifies
+certificates by default (`verify=True`), which rejects the self-signed
+default; pass `verify=False` (as the examples below do, via
+`AOM_VERIFY_SSL=false`) until a real certificate is installed, or point
+`verify` at the exported cert file instead of disabling verification
+entirely.
 
 ## Quickstart
 

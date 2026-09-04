@@ -358,3 +358,13 @@ export interface CaCertificateInfo {
   is_expired: boolean;
   error?: string;
 }
+
+export interface ServerCertificateInfo {
+  subject: string;
+  issuer: string;
+  not_valid_before: string;
+  not_valid_after: string;
+  is_expired: boolean;
+  is_self_signed: boolean;
+  subject_alt_names: string[];
+}

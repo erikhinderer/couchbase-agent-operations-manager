@@ -31,9 +31,12 @@ import asyncio
 import base64
 import hashlib
 import logging
+import os
+import shutil
 import ssl
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import bcrypt
 import jwt
@@ -41,8 +44,16 @@ import ldap3
 from ldap3.utils.conv import escape_filter_chars
 from cryptography import x509
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import serialization
 
-from config import AUTH_SECRET_KEY, AUTH_SESSION_TTL_HOURS
+from config import (
+    AUTH_SECRET_KEY,
+    AUTH_SESSION_TTL_HOURS,
+    TLS_CERT_DEFAULT_BACKUP,
+    TLS_CERT_FILE,
+    TLS_KEY_DEFAULT_BACKUP,
+    TLS_KEY_FILE,
+)
 
 logger = logging.getLogger("operations-manager.user_auth")
 
@@ -338,6 +349,158 @@ async def ldap_authenticate(cfg: dict, username: str, password: str) -> tuple[bo
         return True, "Authenticated.", is_admin
 
     return await asyncio.to_thread(_run)
+
+
+# ---------------------------------------------------------------------------
+# HTTPS server certificate - Settings -> HTTPS Certificate. Separate from the
+# LDAP corporate CA above: that one is a CA the *outbound* LDAPS/StartTLS
+# client trusts; this is the leaf certificate + private key nginx and
+# uvicorn present *to browsers*. Reads/writes config.TLS_CERT_FILE /
+# TLS_KEY_FILE directly - the same two files docker-entrypoint.sh launches
+# uvicorn with and the `ui` service's nginx serves from (shared via a Docker
+# volume - see docker-compose.yml) - so this page always reflects what's
+# actually being served, and neither server picks up a change until it's
+# restarted (TLS listeners don't hot-reload a swapped-out cert file).
+# ---------------------------------------------------------------------------
+def parse_server_certificate(pem_text: str) -> dict:
+    """Validate a PEM-encoded leaf certificate (a chain is fine too - only
+    the first/leaf cert is inspected here) and return the metadata the
+    Settings UI shows. Raises ValueError with a human-readable message on
+    anything that isn't a parseable X.509 certificate."""
+    text = (pem_text or "").strip()
+    if not text:
+        raise ValueError("No certificate provided.")
+    try:
+        cert = x509.load_pem_x509_certificate(text.encode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Could not parse as a PEM X.509 certificate: {exc}") from exc
+
+    def _name(name: x509.Name) -> str:
+        try:
+            return name.rfc4514_string()
+        except Exception:  # noqa: BLE001
+            return str(name)
+
+    san_names: list[str] = []
+    try:
+        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        san_names = [str(entry.value) for entry in san_ext.value]
+    except x509.ExtensionNotFound:
+        san_names = []
+    except Exception:  # noqa: BLE001
+        san_names = []
+
+    return {
+        "subject": _name(cert.subject),
+        "issuer": _name(cert.issuer),
+        "not_valid_before": cert.not_valid_before_utc.isoformat(),
+        "not_valid_after": cert.not_valid_after_utc.isoformat(),
+        "is_expired": cert.not_valid_after_utc <= datetime.now(timezone.utc),
+        "is_self_signed": cert.issuer == cert.subject,
+        "subject_alt_names": san_names,
+    }
+
+
+def _public_key_bytes(pub) -> bytes:
+    return pub.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def validate_server_key_pair(cert_pem: str, key_pem: str) -> dict:
+    """Parse and cross-check a certificate/private-key pair before they're
+    ever written to disk. Raises ValueError (400-worthy) for: unparseable
+    PEM, a password-protected private key (not supported - neither uvicorn
+    nor nginx have a way to be handed a passphrase), or a key that doesn't
+    actually match the certificate's public key - the single most common
+    mistake when pasting these in by hand."""
+    info = parse_server_certificate(cert_pem)
+
+    key_text = (key_pem or "").strip()
+    if not key_text:
+        raise ValueError("No private key provided.")
+    try:
+        private_key = serialization.load_pem_private_key(key_text.encode("utf-8"), password=None)
+    except TypeError as exc:
+        raise ValueError(
+            "This private key is password-protected - remove the passphrase before uploading "
+            "(uvicorn and nginx have no way to be given one)."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Could not parse as a PEM private key: {exc}") from exc
+
+    cert = x509.load_pem_x509_certificate(cert_pem.strip().encode("utf-8"))
+    if _public_key_bytes(cert.public_key()) != _public_key_bytes(private_key.public_key()):
+        raise ValueError("This private key does not match the certificate's public key.")
+
+    return info
+
+
+def _write_file(path: str, text: str, mode: int) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    os.chmod(path, mode)
+
+
+def install_server_certificate(cert_pem: str, key_pem: str) -> dict:
+    """Validate then install a real HTTPS certificate/key pair, replacing
+    the self-signed fallback for both the dashboard and this API. Only
+    takes effect after operations-manager and ui are restarted."""
+    info = validate_server_key_pair(cert_pem, key_pem)
+
+    # Preserve the original baked-in self-signed cert exactly once, the
+    # first time a real certificate is ever installed, so "revert to
+    # default" has something to restore instead of just failing.
+    if os.path.exists(TLS_CERT_FILE) and not os.path.exists(TLS_CERT_DEFAULT_BACKUP):
+        try:
+            shutil.copyfile(TLS_CERT_FILE, TLS_CERT_DEFAULT_BACKUP)
+            if os.path.exists(TLS_KEY_FILE):
+                shutil.copyfile(TLS_KEY_FILE, TLS_KEY_DEFAULT_BACKUP)
+                os.chmod(TLS_KEY_DEFAULT_BACKUP, 0o600)
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("Could not back up the default self-signed certificate: %s", exc)
+
+    _write_file(TLS_CERT_FILE, cert_pem.strip() + "\n", 0o644)
+    _write_file(TLS_KEY_FILE, key_pem.strip() + "\n", 0o600)
+    logger.info("Installed a new HTTPS server certificate (subject=%s) - restart to apply.", info["subject"])
+    return info
+
+
+def current_server_certificate_info() -> dict | None:
+    """Parse whatever certificate is actually on disk right now (never a
+    cached copy), so this always reflects the real state after a restart.
+    None only if the file is missing or unreadable/unparseable."""
+    try:
+        with open(TLS_CERT_FILE, "r") as f:
+            pem = f.read()
+    except OSError:
+        return None
+    try:
+        return parse_server_certificate(pem)
+    except ValueError:
+        return None
+
+
+def can_revert_server_certificate() -> bool:
+    return os.path.exists(TLS_CERT_DEFAULT_BACKUP) and os.path.exists(TLS_KEY_DEFAULT_BACKUP)
+
+
+def revert_server_certificate() -> dict:
+    """Restore the original baked-in self-signed certificate saved by the
+    first install_server_certificate() call. Raises ValueError if no
+    custom certificate was ever installed (nothing to revert from)."""
+    if not can_revert_server_certificate():
+        raise ValueError("No custom certificate has been installed, so there's nothing to revert.")
+    shutil.copyfile(TLS_CERT_DEFAULT_BACKUP, TLS_CERT_FILE)
+    shutil.copyfile(TLS_KEY_DEFAULT_BACKUP, TLS_KEY_FILE)
+    os.chmod(TLS_KEY_FILE, 0o600)
+    logger.info("Reverted to the default self-signed HTTPS certificate - restart to apply.")
+    info = current_server_certificate_info()
+    if info is None:
+        raise ValueError("Reverted the certificate files, but the restored default certificate could not be parsed.")
+    return info
 
 
 def new_local_user_doc(

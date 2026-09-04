@@ -39,10 +39,16 @@ RUN mkdir -p /app/tls && \
 # default CUDA/cuDNN/Triton-enabled build when resolving
 # sentence-transformers' dependency on torch - this container only runs a
 # small embedding model on CPU.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# --default-timeout/--retries: this stack pulls a few large wheels
+# (torch, numpy, sentence-transformers deps) and pip's default 15s
+# read-timeout can trip on a slow or corporate-proxy-inspected
+# connection mid-download, well before the transfer has actually
+# stalled - it just retries silently instead of failing the build.
+RUN pip install --no-cache-dir --default-timeout=100 --retries 5 \
+    torch --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --default-timeout=100 --retries 5 -r requirements.txt
 
 COPY config.py .
 COPY app ./app

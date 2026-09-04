@@ -57,6 +57,7 @@ const SETTINGS_SECTION: NavSection = {
   items: [
     { to: "/settings/accounts", icon: "◍", text: "Accounts & Roles" },
     { to: "/settings/ldap", icon: "⌁", text: "LDAP Authentication" },
+    { to: "/settings/https-cert", icon: "⚿", text: "HTTPS Certificate" },
   ],
 };
 

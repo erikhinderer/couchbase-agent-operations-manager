@@ -7,6 +7,7 @@ import type {
   HealthResponse,
   LdapConfig,
   CaCertificateInfo,
+  ServerCertificateInfo,
   LLMCacheConfig,
   LLMCacheEntry,
   LLMCompleteResponse,
@@ -113,6 +114,23 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ ca_certificate: caCertificate }),
     }),
+
+  tlsCert: () => request<{ info: ServerCertificateInfo | null; can_revert: boolean }>("/v1/auth/tls-cert"),
+  validateTlsCert: (certPem: string, keyPem: string) =>
+    request<{ valid: boolean; info: ServerCertificateInfo }>("/v1/auth/tls-cert/validate", {
+      method: "POST",
+      body: JSON.stringify({ cert_pem: certPem, key_pem: keyPem }),
+    }),
+  installTlsCert: (certPem: string, keyPem: string) =>
+    request<{ info: ServerCertificateInfo; can_revert: boolean; restart_required: boolean }>("/v1/auth/tls-cert", {
+      method: "PUT",
+      body: JSON.stringify({ cert_pem: certPem, key_pem: keyPem }),
+    }),
+  revertTlsCert: () =>
+    request<{ info: ServerCertificateInfo; can_revert: boolean; restart_required: boolean }>(
+      "/v1/auth/tls-cert/revert",
+      { method: "POST" }
+    ),
 
   sdkInfo: () => request<SdkInfo>("/v1/sdk/info"),
   skillInfo: (platform: string) => request<SkillInfo>(`/v1/skills/${platform}/info`),

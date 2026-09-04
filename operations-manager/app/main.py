@@ -381,6 +381,11 @@ class LdapCaCertificateRequest(BaseModel):
     ca_certificate: str
 
 
+class ServerCertificateRequest(BaseModel):
+    cert_pem: str
+    key_pem: str
+
+
 # ---------------------------------------------------------------------------
 # Auth helper
 # ---------------------------------------------------------------------------
@@ -1631,3 +1636,57 @@ async def test_ldap_config(req: LdapTestRequest, request: Request):
     require_admin(request)
     success, detail, is_admin = await user_auth.ldap_authenticate(ldap_config, req.username, req.password)
     return {"success": success, "detail": detail, "would_be_admin": is_admin}
+
+
+# -- Settings -> HTTPS Certificate (admin only) ------------------------------
+# Separate feature from the LDAP corporate CA above - see user_auth.py's
+# section comment for the distinction. This installs the certificate nginx
+# and uvicorn present to browsers, not one this appliance trusts outbound.
+
+@app.get("/v1/auth/tls-cert")
+async def get_tls_cert(request: Request):
+    require_admin(request)
+    return {
+        "info": user_auth.current_server_certificate_info(),
+        "can_revert": user_auth.can_revert_server_certificate(),
+    }
+
+
+@app.post("/v1/auth/tls-cert/validate")
+async def validate_tls_cert(req: ServerCertificateRequest, request: Request):
+    """Parse and cross-check a certificate/key pair without installing them,
+    so the Settings page can preview subject/issuer/expiry/SANs and catch a
+    mismatched key before the admin commits to Install."""
+    require_admin(request)
+    try:
+        info = user_auth.validate_server_key_pair(req.cert_pem, req.key_pem)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"valid": True, "info": info}
+
+
+@app.put("/v1/auth/tls-cert")
+async def put_tls_cert(req: ServerCertificateRequest, request: Request):
+    """Install a real certificate/key pair, replacing the self-signed
+    fallback for both the dashboard and this API. Written straight to the
+    files uvicorn/nginx serve from (see config.TLS_CERT_FILE/TLS_KEY_FILE) -
+    neither picks up the change until operations-manager and ui are
+    restarted, since TLS listeners don't hot-reload a swapped cert file."""
+    require_admin(request)
+    try:
+        info = user_auth.install_server_certificate(req.cert_pem, req.key_pem)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"info": info, "can_revert": True, "restart_required": True}
+
+
+@app.post("/v1/auth/tls-cert/revert")
+async def revert_tls_cert(request: Request):
+    """Restore the original baked-in self-signed certificate, undoing a
+    previous Install. Also requires a restart to take effect."""
+    require_admin(request)
+    try:
+        info = user_auth.revert_server_certificate()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"info": info, "can_revert": False, "restart_required": True}

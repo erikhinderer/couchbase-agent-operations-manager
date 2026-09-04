@@ -157,7 +157,7 @@ or, for a clearer view of the multi-container startup sequence:
 First boot downloads the Couchbase Enterprise image and a local embedding
 model (~100MB, cached afterwards) - give it a few minutes. Then open:
 
-- **Dashboard**: <https://localhost:5173> (log in as `admin` - you'll be
+- **Dashboard**: <https://localhost> (log in as `admin` - you'll be
   asked to set that account's password the first time)
 - **Operations Manager API**: <https://localhost:8090> (see `/docs` for the
   OpenAPI UI)
@@ -178,7 +178,7 @@ Couchbase and embedding-model-cache volumes).
 
 ## HTTPS / TLS
 
-The dashboard (nginx, port 5173→443) and the Operations Manager API
+The dashboard (nginx, published on the standard HTTPS port 443) and the Operations Manager API
 (uvicorn, port 8090) both serve HTTPS by default, including the internal
 proxy hop nginx makes to the API. Each image bakes in a self-signed
 certificate at build time (`operations-manager/Dockerfile`,
@@ -187,10 +187,29 @@ your browser will warn about the self-signed cert, and `curl`/SDK calls
 need `-k` / `verify=False` (see the [Developer SDK](#developer-sdk)
 section) until you swap in a real one.
 
-**Using your own certificate.** Drop a `server.crt`/`server.key` pair into
-`operations-manager/tls/` and `ui/tls/` (both are gitignored - never
-commit private keys) and uncomment the matching volume mount in
-`docker-compose.yml`:
+**Using your own certificate - Settings page (recommended).** Log in as an
+admin and open Settings → HTTPS Certificate: paste or upload a PEM
+certificate (a leaf cert, or a leaf + intermediate chain concatenated) and
+its matching unencrypted private key, validate the pair, then install.
+This writes straight into `tls-shared`, a Docker volume shared by both
+`operations-manager` and `ui` (see `docker-compose.yml`) - one upload
+covers the dashboard and the API. Neither server hot-reloads a changed
+certificate, so restart both afterward:
+
+```bash
+docker compose restart operations-manager ui
+```
+
+The page also shows the certificate currently in use (subject, issuer,
+validity, and whether it's still the self-signed default) and can revert
+back to that default if needed.
+
+**Using your own certificate - bind mount (alternative).** If you'd rather
+manage the files yourself instead of using the Settings page, drop a
+`server.crt`/`server.key` pair into `operations-manager/tls/` and
+`ui/tls/` (both are gitignored - never commit private keys), then in
+`docker-compose.yml` comment out each service's `tls-shared:` volume line
+and uncomment the bind-mount line right below it:
 
 ```yaml
 # operations-manager service
@@ -202,8 +221,10 @@ volumes:
   - ./ui/tls:/etc/nginx/tls:ro
 ```
 
-Restart with `docker compose up --build` and both containers pick up the
-mounted cert instead of the baked-in one - no other configuration changes.
+Only one mount can occupy each of those paths, so don't leave both
+uncommented. Restart with `docker compose up --build` and both containers
+pick up the mounted cert instead of the shared volume's - no other
+configuration changes.
 
 **Disabling TLS.** If you need plain HTTP (e.g. running behind a load
 balancer that already terminates TLS), set `DISABLE_TLS=true` for

@@ -145,8 +145,18 @@ services:
       LOG_LEVEL: INFO
     volumes:
       - hf-cache:/root/.cache/huggingface
-      # Uncomment to use your own TLS certificate instead of the baked-in
-      # self-signed fallback - files must be named server.crt/server.key:
+      # HTTPS certificate storage, shared with the `ui` service's
+      # /etc/nginx/tls below - one certificate, installed once, serves
+      # both the API and the dashboard. Starts out populated with the
+      # baked-in self-signed fallback (Docker copies the image's existing
+      # /app/tls into this volume the first time it's used, since the
+      # volume starts empty) and from then on holds whatever Settings ->
+      # HTTPS Certificate has installed - see app/user_auth.py.
+      - tls-shared:/app/tls
+      # Alternative to the Settings page: bind-mount your own cert/key
+      # directly instead (files must be named server.crt/server.key) - do
+      # NOT use this at the same time as the line above, since only one
+      # mount can occupy /app/tls:
       # - ./operations-manager/tls:/app/tls:ro
     healthcheck:
       # Tries HTTPS first (the default), then plain HTTP, so this works
@@ -173,24 +183,27 @@ services:
         condition: service_healthy
     ports:
       # Serves HTTPS on 443 (self-signed by default, baked into the image -
-      # see ui/Dockerfile) at the same host port people already had
-      # bookmarked for the dashboard - it just speaks TLS now, so use
-      # https://localhost:5173 instead of http://. Plain HTTP still exists
-      # inside the container (nginx.conf.template redirects it to HTTPS);
-      # publish it too - e.g. add "5180:80" here - if you want that
-      # redirect reachable from the host as well.
-      - "5173:443"
+      # see ui/Dockerfile), published on the standard HTTPS host port so
+      # the dashboard is just https://localhost with no port number. Plain
+      # HTTP still exists inside the container (nginx.conf.template
+      # redirects it to HTTPS); publish it too - e.g. add "80:80" here -
+      # if you want that redirect reachable from the host as well.
+      - "443:443"
     environment:
       OPERATIONS_MANAGER_UPSTREAM: operations-manager:8090
       # Must match operations-manager's own TLS state (see DISABLE_TLS
       # above) - this is what scheme nginx uses for its own proxy hop to it.
       OPERATIONS_MANAGER_SCHEME: ${OPERATIONS_MANAGER_SCHEME:-https}
-    # To use your own TLS certificate instead of the baked-in self-signed
-    # fallback, add a volumes section here (files must be named
-    # server.crt/server.key):
-    #   volumes:
-    #     - ./ui/tls:/etc/nginx/tls:ro
+    volumes:
+      # Same shared volume as operations-manager's /app/tls above - one
+      # certificate installed via Settings -> HTTPS Certificate applies to
+      # both services. Alternative: bind-mount your own cert/key instead
+      # (files must be named server.crt/server.key), but not both at once:
+      #   volumes:
+      #     - ./ui/tls:/etc/nginx/tls:ro
+      - tls-shared:/etc/nginx/tls
 
 volumes:
   couchbase-data:
   hf-cache:
+  tls-shared:

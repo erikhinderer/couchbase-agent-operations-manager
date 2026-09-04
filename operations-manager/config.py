@@ -142,3 +142,23 @@ DEFAULT_ADMIN_USERNAME = os.getenv("DEFAULT_ADMIN_USERNAME", "admin")
 # Couchbase settings-collection doc id for the LDAP configuration (same
 # settings::<name> convention as settings::llm_cache) - see app/user_auth.py.
 LDAP_SETTINGS_DOC = "settings::ldap"
+
+
+# ---------------------------------------------------------------------------
+# HTTPS server certificate (see Settings -> HTTPS Certificate, app/user_auth.py)
+# ---------------------------------------------------------------------------
+# Same two paths and same env var names as operations-manager/docker-entrypoint.sh
+# uses to launch uvicorn, so the Settings page always reads/writes exactly the
+# file uvicorn is actually serving from - never a copy that could drift out of
+# sync with it. These live in a Docker named volume shared with the `ui`
+# service's /etc/nginx/tls (see docker-compose.yml), so one uploaded
+# certificate applies to both the dashboard and the API, and a self-signed
+# fallback baked into the image still populates the volume on first boot.
+TLS_CERT_FILE = os.getenv("TLS_CERT_FILE", "/app/tls/server.crt")
+TLS_KEY_FILE = os.getenv("TLS_KEY_FILE", "/app/tls/server.key")
+# Where the baked-in self-signed fallback is backed up the first time a real
+# certificate is installed, so Settings -> HTTPS Certificate can offer
+# "revert to the default self-signed certificate" without needing to
+# regenerate one from scratch.
+TLS_CERT_DEFAULT_BACKUP = TLS_CERT_FILE + ".default-backup"
+TLS_KEY_DEFAULT_BACKUP = TLS_KEY_FILE + ".default-backup"

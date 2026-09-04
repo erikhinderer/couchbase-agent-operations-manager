@@ -13,6 +13,7 @@ import { AgentToolAuditPage } from "./pages/AgentToolAuditPage";
 import { DeveloperSdkPage } from "./pages/DeveloperSdkPage";
 import { SettingsAccountsPage } from "./pages/SettingsAccountsPage";
 import { SettingsLdapPage } from "./pages/SettingsLdapPage";
+import { SettingsHttpsCertificatePage } from "./pages/SettingsHttpsCertificatePage";
 import { LoginPage } from "./pages/LoginPage";
 import { RequirePasswordChangePage } from "./pages/RequirePasswordChangePage";
 import { useAuth } from "./auth/AuthContext";
@@ -76,6 +77,14 @@ export default function App() {
             element={
               <AdminRoute>
                 <SettingsLdapPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/settings/https-cert"
+            element={
+              <AdminRoute>
+                <SettingsHttpsCertificatePage />
               </AdminRoute>
             }
           />
