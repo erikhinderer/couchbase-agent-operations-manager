@@ -34,7 +34,7 @@ RUN mkdir -p /app/tls && \
       -subj "/CN=localhost" \
       -addext "subjectAltName=DNS:localhost,DNS:operations-manager,DNS:agent-operations-manager,IP:127.0.0.1" \
       2>/dev/null && \
-    chmod 600 /app/tls/server.key
+    chmod 640 /app/tls/server.key
 
 # Install the CPU-only build of torch first so pip doesn't pull in the
 # default CUDA/cuDNN/Triton-enabled build when resolving
@@ -72,10 +72,22 @@ RUN chmod +x docker-entrypoint.sh
 # resolve their model cache to the same path the hf-cache volume in
 # docker-compose.yml mounts (.../home/appuser/.cache/huggingface, not
 # /root/...) - keep those two in sync if either one ever moves.
+# appuser is added as a *supplementary* member of the root group (gid 0,
+# not primary - its primary group stays appuser/10001) purely so it can
+# hand out group-read access on the TLS private key to a group it
+# belongs to (see _grant_group_root_read() in app/user_auth.py) without
+# needing root privileges itself. This is what lets the ui container's
+# nginx (root master process, before it setuid()s to the unprivileged
+# nginx user) read a key file it doesn't own, under ui's cap_drop: [ALL]
+# hardening in docker-compose.yml - without that, either nginx couldn't
+# load the key at all, or the key would have to be world-readable.
 RUN groupadd --system --gid 10001 appuser \
     && useradd --system --uid 10001 --gid appuser --home-dir /home/appuser --create-home --shell /usr/sbin/nologin appuser \
+    && usermod -aG root appuser \
     && mkdir -p /home/appuser/.cache/huggingface \
-    && chown -R appuser:appuser /app /home/appuser
+    && chown -R appuser:appuser /app /home/appuser \
+    && chown appuser:root /app/tls/server.key \
+    && chmod 640 /app/tls/server.key
 ENV HOME=/home/appuser
 USER appuser
 

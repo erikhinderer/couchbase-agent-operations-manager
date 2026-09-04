@@ -468,6 +468,30 @@ def _write_file(path: str, text: str, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def _grant_group_root_read(path: str) -> None:
+    """Let the ui container's nginx (root master process, pre-setuid) read
+    the private key without making it world-readable. nginx and
+    operations-manager run as different unprivileged users in different
+    containers (uid 101 "nginx" vs. uid 10001 "appuser"), and ui's
+    cap_drop: [ALL] (see docker-compose.yml) intentionally removed
+    CAP_DAC_OVERRIDE, so a 0600 file owned by appuser is unreadable to
+    nginx's root process no matter which user owns it. appuser is a
+    supplementary member of the root group (gid 0) for exactly this
+    reason (see operations-manager/Dockerfile), so it can hand out
+    group-read access to a group it belongs to without needing full root
+    privileges. Group-owning the key by root and setting mode 0640 keeps
+    it unreadable to any other unprivileged user/service while still
+    letting nginx's root process load it. Best-effort: swallow failures
+    so this still works when run outside the hardened container (e.g.
+    local dev, tests) where the root group membership doesn't exist.
+    """
+    try:
+        os.chown(path, -1, 0)
+        os.chmod(path, 0o640)
+    except OSError as exc:  # noqa: BLE001
+        logger.warning("Could not grant group-root read access to %s: %s", path, exc)
+
+
 def install_server_certificate(cert_pem: str, key_pem: str) -> dict:
     """Validate then install a real HTTPS certificate/key pair, replacing
     the self-signed fallback for both the dashboard and this API. Only
@@ -488,6 +512,7 @@ def install_server_certificate(cert_pem: str, key_pem: str) -> dict:
 
     _write_file(TLS_CERT_FILE, cert_pem.strip() + "\n", 0o644)
     _write_file(TLS_KEY_FILE, key_pem.strip() + "\n", 0o600)
+    _grant_group_root_read(TLS_KEY_FILE)
     logger.info("Installed a new HTTPS server certificate (subject=%s) - restart to apply.", info["subject"])
     return info
 
@@ -520,6 +545,7 @@ def revert_server_certificate() -> dict:
     shutil.copyfile(TLS_CERT_DEFAULT_BACKUP, TLS_CERT_FILE)
     shutil.copyfile(TLS_KEY_DEFAULT_BACKUP, TLS_KEY_FILE)
     os.chmod(TLS_KEY_FILE, 0o600)
+    _grant_group_root_read(TLS_KEY_FILE)
     logger.info("Reverted to the default self-signed HTTPS certificate - restart to apply.")
     info = current_server_certificate_info()
     if info is None:

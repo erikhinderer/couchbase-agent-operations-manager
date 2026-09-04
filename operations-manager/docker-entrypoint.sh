@@ -22,6 +22,19 @@ if [ ! -f "$TLS_KEY_FILE" ] || [ ! -f "$TLS_CERT_FILE" ]; then
   exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8090
 fi
 
+# $TLS_KEY_FILE lives on the tls-shared volume, which ui's nginx also
+# mounts (at /etc/nginx/tls) to serve the same certificate. That volume
+# persists across image rebuilds, so a key file left over from before
+# this permission scheme existed - or written by an older image - won't
+# get fixed just by rebuilding. Re-assert group-root-readable + 0640 on
+# every startup (self-heals stale volumes) so nginx's root master
+# process (which lost CAP_DAC_OVERRIDE under ui's cap_drop: [ALL]
+# hardening in docker-compose.yml) can always read it. See
+# _grant_group_root_read() in app/user_auth.py for the same fix applied
+# whenever a certificate is installed/reverted at runtime.
+chgrp root "$TLS_KEY_FILE" 2>/dev/null || true
+chmod 640 "$TLS_KEY_FILE" 2>/dev/null || true
+
 echo "[entrypoint] Serving HTTPS on :8090 (cert: $TLS_CERT_FILE)"
 exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8090 \
   --ssl-keyfile "$TLS_KEY_FILE" \
