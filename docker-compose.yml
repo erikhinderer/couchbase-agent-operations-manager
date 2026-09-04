@@ -39,9 +39,20 @@ services:
       retries: 30
       start_period: 60s
 
+  # ---------------------------------------------------------------------
+  # One-time cluster/bucket/collection provisioning for Couchbase. init.sh
+  # is fully idempotent (every mutating step tolerates "already exists"),
+  # so it's safe to let this run on every startup. Rather than exiting
+  # when it's done - which Docker Desktop shows as a stopped container
+  # even though that's expected/healthy - it touches a sentinel file and
+  # then idles, and the healthcheck below reports healthy once that
+  # sentinel exists. operations-manager waits on that healthcheck (not on
+  # this container exiting) before it starts.
+  # ---------------------------------------------------------------------
   couchbase-init:
     image: couchbase:enterprise-7.6.2
     container_name: agent-operations-couchbase-init
+    restart: unless-stopped
     depends_on:
       couchbase:
         condition: service_healthy
@@ -53,7 +64,12 @@ services:
       COUCHBASE_BUCKET: ${COUCHBASE_BUCKET:-agent_operations}
       COUCHBASE_SCOPE: ${COUCHBASE_SCOPE:-agent_operations}
     entrypoint: ["/bin/sh", "/init.sh"]
-    restart: on-failure:3
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/init-complete"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 90s
     security_opt:
       - no-new-privileges:true
 
@@ -110,16 +126,18 @@ services:
     depends_on:
       couchbase:
         condition: service_healthy
-      # couchbase-init is a one-shot provisioning container (creates the
-      # bucket/scope/collections operations-manager writes to on startup, e.g.
-      # the identities collection it seeds API keys into). Waiting only for
-      # it to *start* - the old plain-list form of depends_on - let
-      # operations-manager race it and crash with ScopeNotFoundException before
-      # the scope existed. service_completed_successfully blocks
-      # operations-manager from starting at all until that script has actually
-      # finished (exit code 0).
+      # couchbase-init provisions the bucket/scope/collections
+      # operations-manager writes to on startup (e.g. the identities
+      # collection it seeds API keys into) and then idles rather than
+      # exiting. Waiting only for it to *start* - the old plain-list form
+      # of depends_on - let operations-manager race it and crash with
+      # ScopeNotFoundException before the scope existed, and waiting for
+      # it to *exit* doesn't work now that it stays running. service_healthy
+      # blocks operations-manager from starting until init.sh has actually
+      # finished (its healthcheck only passes once the sentinel file it
+      # writes at the end of the script exists).
       couchbase-init:
-        condition: service_completed_successfully
+        condition: service_healthy
       sample-mcp-servers:
         condition: service_healthy
     ports:
@@ -214,12 +232,19 @@ services:
       - ALL
     # nginx's master process runs as root inside the container (its
     # workers drop to the unprivileged `nginx` user automatically - see
-    # the base image's own nginx.conf) specifically so it can bind ports
-    # 80/443; CAP_NET_BIND_SERVICE is the one capability that requires,
-    # so it's added back after the blanket cap_drop above rather than
-    # left off entirely.
+    # the base image's own nginx.conf). That startup sequence needs more
+    # than just the ability to bind ports 80/443 (CAP_NET_BIND_SERVICE):
+    # the master process also chown()s /var/cache/nginx/* to the `nginx`
+    # user (CAP_CHOWN) and then setuid()/setgid()s into that user before
+    # forking workers (CAP_SETUID, CAP_SETGID). All four are added back
+    # after the blanket cap_drop above; dropping any of them causes nginx
+    # to fail at startup with "chown(...) failed (1: Operation not
+    # permitted)" and crash-loop under restart: unless-stopped.
     cap_add:
       - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
     depends_on:
       operations-manager:
         condition: service_healthy

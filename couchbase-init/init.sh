@@ -106,3 +106,15 @@ for COLLECTION in servers tools identities access_log llm_cache llm_cache_log se
 done
 
 echo "[couchbase-init] Couchbase provisioning complete."
+
+# Provisioning is idempotent and safe to re-run, so rather than exiting
+# (which Docker/Docker Desktop shows as a stopped/"unhealthy-looking"
+# container even though nothing is wrong), this container marks itself
+# done via a sentinel file - the healthcheck in docker-compose.yml just
+# checks for its existence - and then idles forever. operations-manager
+# waits on this container's *healthcheck*, not its exit code, so this is
+# safe: see the service_healthy condition on couchbase-init in
+# docker-compose.yml.
+echo "[couchbase-init] Marking init complete and idling (keeps this container running so Docker Desktop shows it healthy/green instead of exited)..."
+touch /tmp/init-complete
+exec tail -f /dev/null
