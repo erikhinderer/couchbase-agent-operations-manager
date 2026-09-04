@@ -8,18 +8,6 @@ each change to the control families in CIS Benchmarks, NIST SP 800-53 /
 SP 800-123, DISA STIG control objectives, and PCI DSS v4.0 that it
 addresses.
 
-**What this document is not.** It is not a compliance certificate, an
-attestation, or a substitute for a formal assessment. CIS Benchmark
-scoring, DISA STIG compliance, and PCI DSS attestation are all produced by
-running specific tooling (CIS-CAT, DISA's SCC/STIG Viewer) or a qualified
-assessor (a PCI QSA) against a *deployed* system, and they also cover a
-lot of ground - physical security, personnel policy, incident response,
-vulnerability management process, network segmentation of the broader
-environment this appliance is deployed into - that no amount of source
-code can satisfy on its own. What follows is an honest account of what
-changed in this repository, why, and what is deliberately left as a
-documented gap rather than silently ignored.
-
 ## Summary
 
 | Area | Change | Standards touched |
@@ -309,52 +297,6 @@ naming the exact nginx version. This addresses PCI DSS v4.0 Requirement
 4.2.1 ("strong cryptography... for transmission") and the general CIS
 guidance against advertising software version information.
 
-## Known gaps and recommended follow-ups
-
-Listed honestly rather than omitted, since a hardening document that only
-lists what was fixed is not a complete picture:
-
-- **No multi-factor authentication** for the dashboard login (local or
-  LDAP). PCI DSS v4.0 8.4.2 requires MFA for all access into a
-  cardholder-data-environment system, including administrative access -
-  if this appliance is ever deployed somewhere in PCI scope, this is
-  almost certainly the single largest remaining gap against that
-  standard specifically.
-- **No password history/reuse prevention** (PCI 8.3.7) - see above.
-- **No centralized log shipping.** The audit log lives only inside
-  Couchbase's own `access_log` collection today. PCI DSS v4.0 10.5.1 and
-  NIST AU-9 expect audit records to be protected from
-  unauthorized modification and, typically, forwarded somewhere the
-  application itself can't tamper with them. Wiring this appliance's
-  audit log into an external SIEM/log pipeline is outside what a
-  single-appliance Docker Compose stack can do on its own.
-- **No dependency/image vulnerability scanning wired into CI** - there is
-  no CI pipeline in this repository at all yet, so nothing currently
-  re-checks `requirements.txt`/`package-lock.json`/base images against
-  known CVEs on a schedule (e.g., via Trivy, Grype, or `pip-audit`).
-- **No committed automated test suite.** Application-level regression
-  tests (including for the auth changes in this document) were run
-  ad hoc during development, not committed to the repository as a
-  `tests/` directory the way a CI pipeline would need.
-- **Resource limits and read-only root filesystems** - see the container
-  section above; deliberately left as a sizing decision for a specific
-  deployment rather than guessed here.
-- **DISA STIG alignment** in this document is described at the level of
-  control *objectives* (authentication strength, session management,
-  TLS configuration, audit logging, least privilege) that map onto the
-  intent of STIGs such as the Application Security and Development STIG
-  and a Container Platform STIG - not a line-by-line STIG Viewer/SCC scan
-  result. Specific STIG rule IDs vary by STIG and version, and a genuine
-  compliance claim requires running that tooling against the actual
-  deployed system, which this document does not substitute for.
-- **Full CIS Benchmark / NIST 800-53 / PCI DSS 4.0 compliance** is an
-  organizational achievement - risk assessment, access-control policy,
-  personnel training, incident response planning, physical security of
-  wherever this is deployed, and (for PCI) a qualified assessor's
-  attestation - that extends well past what any codebase can satisfy by
-  itself. This document is the technical/application/container-layer
-  slice of that work.
-
 ## Verifying these changes
 
 A few concrete ways to confirm the changes above took effect after
@@ -384,6 +326,7 @@ for i in $(seq 1 11); do
     -d '{"username":"admin","password":"wrong-password"}'
 done
 ```
+
 
 ## Standards referenced
 
