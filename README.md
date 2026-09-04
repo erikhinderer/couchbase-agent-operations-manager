@@ -66,7 +66,7 @@ what the caching actually saved.
                      └─────────────────────────────────────────────┘
                                           │
                                           ▼
-                   your real        ┌───────────┐
+                                    ┌───────────┐
                    MCP servers  ───▶│ Couchbase │  servers / tools /
                    (registered      │           │  agent_memory (conversational /
                     & trusted)      │           │    profile / semantic) /
