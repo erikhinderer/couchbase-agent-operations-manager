@@ -2,7 +2,7 @@
 
 This document tracks the security hardening work applied to the Couchbase
 Agent Operations Manager appliance's own code and configuration - the
-application (`operations-manager`), the sample MCP servers, the dashboard
+application (`operations-manager`), the dashboard
 (`ui`), and the Docker Compose stack that ties them together - and maps
 each change to the control families in CIS Benchmarks, NIST SP 800-53 /
 SP 800-123, DISA STIG control objectives, and PCI DSS v4.0 that it
