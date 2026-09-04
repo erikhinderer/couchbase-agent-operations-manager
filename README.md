@@ -68,6 +68,8 @@ what the caching actually saved.
                                           ▼
                                     ┌───────────┐
                                     │ Couchbase │  servers / tools /
+                                    │           │  agent_memory (conversational /
+                                    │           │    profile / semantic) /
                                     │           │  identities / access_log
                                     │           │  llm_cache / llm_cache_log
                                     └───────────┘
@@ -240,6 +242,26 @@ CA's PEM so the appliance can validate the LDAP server's certificate. This
 is also unrelated to `scripts/setup-corporate-ca.sh`, which is a
 build-time-only helper for trusting a TLS-inspecting proxy CA during
 `docker compose build` (see the note under [Run it](#run-it)).
+
+## Security Hardening
+
+Beyond HTTPS/TLS, this repository has been hardened against a set of
+industry security baselines: CIS Benchmarks, NIST SP 800-53 / SP 800-123,
+DISA STIG control objectives, and PCI DSS v4.0. That work spans the
+FastAPI backend (CORS lockdown, security response headers, a 12-character
+password policy, login lockout after repeated failed attempts, auth
+audit logging, default-credential warnings), the Docker Compose stack
+(non-root containers, dropped Linux capabilities, `no-new-privileges`,
+Couchbase's admin/data ports and the sample MCP servers bound to
+localhost only), and nginx (a hardened TLS cipher suite, `server_tokens
+off`, and the same security headers on the dashboard).
+
+See [SECURITY_HARDENING.md](./SECURITY_HARDENING.md) for the full
+change-by-change writeup, the specific standard/requirement each change
+addresses, what was reviewed and already found compliant, and - just as
+important - the gaps that remain (MFA for dashboard login and password
+history are the two biggest) along with why they're not silently glossed
+over.
 
 ## Using the dashboard
 

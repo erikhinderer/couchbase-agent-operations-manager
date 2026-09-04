@@ -31,6 +31,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY app ./app
 
+# Run as an unprivileged user (CIS Docker Benchmark 4.1 / NIST SP 800-190).
+# uvicorn binds :8100, an unprivileged port, so nothing at runtime needs
+# root - apt-get and pip install already happened above as root, at build
+# time.
+RUN groupadd --system --gid 10001 appuser \
+    && useradd --system --uid 10001 --gid appuser --home-dir /home/appuser --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8100
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=15 \

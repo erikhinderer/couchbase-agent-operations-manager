@@ -65,12 +65,36 @@ UI_ROLES = {
     "user": "Every dashboard page except Settings.",
 }
 DEFAULT_LOCAL_ROLE = "user"
-MIN_PASSWORD_LENGTH = 8
+# PCI DSS v4.0 8.3.6 sets 12 characters as the minimum for systems that
+# support it (versus the 8-character floor allowed only when a system
+# cannot support 12 and compensating controls are in place - this one can,
+# so it doesn't get the exception). NIST SP 800-63B's guidance is length
+# over forced character-class complexity, which is why this checks length
+# plus a small set of concrete weaknesses (common/breached passwords,
+# password == username) rather than requiring e.g. "one symbol, one digit".
+MIN_PASSWORD_LENGTH = 12
+
+# Not an exhaustive breached-password list (that would mean shipping/
+# fetching a real corpus, e.g. Have I Been Pwned's list, which is a
+# deployment-time decision for an operator to make, not a hardcoded
+# default) - this catches the specific passwords an admin is most likely
+# to type in a hurry on first boot, which password_policy_error's length
+# check alone would happily accept (e.g. "changeme123!" is 12 characters).
+_COMMON_WEAK_PASSWORDS = {
+    "password", "password1", "password123", "changeme", "changeme123",
+    "changeit", "letmein", "welcome1", "admin1234", "administrator",
+    "qwerty123", "abc123456", "iloveyou1", "couchbase", "couchbasedemo123",
+}
 
 
-def password_policy_error(password: str) -> str | None:
+def password_policy_error(password: str, username: str | None = None) -> str | None:
     if not password or len(password) < MIN_PASSWORD_LENGTH:
         return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    normalized = password.strip().lower()
+    if normalized in _COMMON_WEAK_PASSWORDS:
+        return "That password is too common - choose something less guessable."
+    if username and normalized == username.strip().lower():
+        return "Password cannot be the same as the username."
     return None
 
 
@@ -501,6 +525,78 @@ def revert_server_certificate() -> dict:
     if info is None:
         raise ValueError("Reverted the certificate files, but the restored default certificate could not be parsed.")
     return info
+
+
+# ---------------------------------------------------------------------------
+# Login throttling / account lockout - PCI DSS v4.0 8.3.4 ("limit repeated
+# access attempts by locking out the user ID after not more than 10
+# attempts, for a minimum lockout duration of 30 minutes") and NIST SP
+# 800-53 AC-7 (Unsuccessful Logon Attempts). In-memory and per-process by
+# design, matching this appliance's current single-instance architecture
+# (see docs/aom-distribution-architecture in the project notes) - state
+# resets on restart and is not shared across replicas if this is ever run
+# horizontally scaled, which is a documented limitation, not an oversight.
+#
+# Two independent counters:
+#   - per-username: the PCI 8.3.4 control itself, protects one account
+#     against being brute-forced regardless of source IP.
+#   - per-IP: defense in depth against a single source spraying many
+#     different usernames, which the per-username counter alone never
+#     trips on any one of them.
+# ---------------------------------------------------------------------------
+LOGIN_LOCKOUT_THRESHOLD = 10
+LOGIN_LOCKOUT_WINDOW_SECONDS = 15 * 60
+LOGIN_LOCKOUT_DURATION_SECONDS = 30 * 60
+IP_LOCKOUT_THRESHOLD = 30
+IP_LOCKOUT_WINDOW_SECONDS = 5 * 60
+IP_LOCKOUT_DURATION_SECONDS = 15 * 60
+
+_failed_by_username: dict[str, list[float]] = {}
+_failed_by_ip: dict[str, list[float]] = {}
+_locked_until: dict[str, float] = {}
+
+
+def _prune(timestamps: list[float], window_seconds: int, now: float) -> list[float]:
+    return [t for t in timestamps if now - t < window_seconds]
+
+
+def login_lockout_status(username: str, ip: str) -> tuple[bool, int]:
+    """Returns (locked, retry_after_seconds). Call before checking the
+    password so a locked-out account never even reaches bcrypt/LDAP."""
+    now = time.time()
+    for key in (f"user:{username.strip().lower()}", f"ip:{ip}"):
+        until = _locked_until.get(key)
+        if until and until > now:
+            return True, int(until - now) + 1
+        if until:
+            del _locked_until[key]
+    return False, 0
+
+
+def record_failed_login(username: str, ip: str) -> None:
+    now = time.time()
+    ukey = username.strip().lower()
+    attempts = _prune(_failed_by_username.get(ukey, []), LOGIN_LOCKOUT_WINDOW_SECONDS, now)
+    attempts.append(now)
+    _failed_by_username[ukey] = attempts
+    if len(attempts) >= LOGIN_LOCKOUT_THRESHOLD:
+        _locked_until[f"user:{ukey}"] = now + LOGIN_LOCKOUT_DURATION_SECONDS
+        logger.warning("Account '%s' locked out for %ds after %d failed login attempts.", ukey, LOGIN_LOCKOUT_DURATION_SECONDS, len(attempts))
+
+    ip_attempts = _prune(_failed_by_ip.get(ip, []), IP_LOCKOUT_WINDOW_SECONDS, now)
+    ip_attempts.append(now)
+    _failed_by_ip[ip] = ip_attempts
+    if len(ip_attempts) >= IP_LOCKOUT_THRESHOLD:
+        _locked_until[f"ip:{ip}"] = now + IP_LOCKOUT_DURATION_SECONDS
+        logger.warning("Source IP %s locked out for %ds after %d failed login attempts across accounts.", ip, IP_LOCKOUT_DURATION_SECONDS, len(ip_attempts))
+
+
+def record_successful_login(username: str, ip: str) -> None:
+    """A successful login clears that username's failed-attempt counter
+    (not the per-IP one - a spraying attacker who eventually guesses one
+    account's password shouldn't get the other accounts' protection reset)."""
+    _failed_by_username.pop(username.strip().lower(), None)
+    _locked_until.pop(f"user:{username.strip().lower()}", None)
 
 
 def new_local_user_doc(

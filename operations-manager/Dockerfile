@@ -63,6 +63,22 @@ ENV TOKENIZERS_PARALLELISM=false
 COPY docker-entrypoint.sh .
 RUN chmod +x docker-entrypoint.sh
 
+# Run as an unprivileged user (CIS Docker Benchmark 4.1 / NIST SP 800-190 -
+# containers shouldn't run application processes as root). uvicorn binds
+# :8090, an unprivileged port, so nothing here needs root at runtime -
+# everything that did (apt-get, the corp-CA trust bootstrap, cert
+# generation, pip install) already happened above as root, at build time.
+# Home dir matches HOME below so huggingface_hub/sentence-transformers
+# resolve their model cache to the same path the hf-cache volume in
+# docker-compose.yml mounts (.../home/appuser/.cache/huggingface, not
+# /root/...) - keep those two in sync if either one ever moves.
+RUN groupadd --system --gid 10001 appuser \
+    && useradd --system --uid 10001 --gid appuser --home-dir /home/appuser --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /home/appuser/.cache/huggingface \
+    && chown -R appuser:appuser /app /home/appuser
+ENV HOME=/home/appuser
+USER appuser
+
 EXPOSE 8090
 
 # Tries HTTPS first (the default - see docker-entrypoint.sh), then falls

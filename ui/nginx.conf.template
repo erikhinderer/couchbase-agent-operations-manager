@@ -19,6 +19,40 @@ server {
     ssl_certificate     /etc/nginx/tls/server.crt;
     ssl_certificate_key /etc/nginx/tls/server.key;
     ssl_protocols TLSv1.2 TLSv1.3;
+    # Modern, AEAD-only cipher list (PCI DSS v4.0 4.2.1 / CIS "strong
+    # cryptography" language) - no RC4/3DES/CBC-mode TLS 1.2 suites, no
+    # static-RSA key exchange (no forward secrecy). TLS 1.3's own suites
+    # aren't controlled by ssl_ciphers at all, so this only constrains the
+    # TLS 1.2 side of ssl_protocols above.
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers on;
+    # Single instance, no shared ticket-key rotation across replicas -
+    # session cache (below) gives resumption without the forward-secrecy
+    # tradeoff of long-lived static session ticket keys.
+    ssl_session_tickets off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # Don't advertise the exact nginx version in the Server header or on
+    # generated error pages (CIS "minimize information disclosure").
+    server_tokens off;
+
+    # Security response headers, applied to every response from this
+    # server block (CIS Benchmark / PCI DSS 4.0 6.2 / NIST SC-23 secure
+    # defaults for a browser-facing app). `always` so they're also sent on
+    # non-2xx responses (4xx/5xx pages), not just successful ones.
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+    # script-src has no 'unsafe-inline': the one script index.html used to
+    # inline (theme-flash prevention) now lives at /theme-init.js instead
+    # (see ui/public/theme-init.js) specifically so this can stay strict.
+    # style-src keeps 'unsafe-inline' because the dashboard sets React
+    # inline `style={{...}}` props throughout - tightening that further
+    # would mean re-architecting styling app-wide, not a nginx config change.
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'" always;
 
     root /usr/share/nginx/html;
     index index.html;
@@ -56,6 +90,7 @@ server {
         proxy_ssl_verify off;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 

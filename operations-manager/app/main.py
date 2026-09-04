@@ -38,6 +38,7 @@ from config import (
     APPLIANCE_NAME,
     AUTH_SECRET_KEY,
     AUTH_SESSION_TTL_HOURS,
+    CORS_ALLOWED_ORIGINS,
     COUCHBASE_CONFIG,
     DEFAULT_ADMIN_USERNAME,
     EMBEDDING_CONFIG,
@@ -60,7 +61,62 @@ app = FastAPI(
     description="RBAC + Couchbase Vector Search pre-filtering gateway for MCP tool servers.",
     version="1.0.0",
 )
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# CORS: the dashboard session cookie makes this security-sensitive (see
+# config.CORS_ALLOWED_ORIGINS) - a wildcard origin combined with
+# allow_credentials=True would let *any* site's browser JS ride a logged-in
+# admin's session cookie to this API. With no origins configured (the
+# out-of-the-box case, since the dashboard is always same-origin through
+# nginx - see ui/nginx.conf.template), credentialed cross-origin access is
+# simply off; agent callers using a Bearer API key are entirely unaffected,
+# since that's a header they set themselves; never something a browser
+# attaches automatically the way it does a cookie.
+if CORS_ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Security response headers - CIS/PCI-DSS-4.0/NIST-SC-23-aligned defaults
+# for every response this API sends. /docs and /redoc are excluded from the
+# CSP because FastAPI's bundled Swagger/ReDoc UI loads its JS/CSS from a
+# CDN - a strict default-src 'self' there would just break the docs page,
+# not protect anything (it's dev/ops tooling, not an attacker-reachable
+# surface any differently than the rest of the API).
+# ---------------------------------------------------------------------------
+_NO_CSP_PATH_PREFIXES = ("/docs", "/redoc", "/openapi.json")
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+    # HSTS only makes sense once a client has actually reached us over TLS -
+    # this appliance serves HTTPS by default but DISABLE_TLS=true remains a
+    # supported plain-HTTP mode (see docker-entrypoint.sh), and sending
+    # HSTS over plain HTTP is a no-op at best and a footgun at worst.
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    if not request.url.path.startswith(_NO_CSP_PATH_PREFIXES):
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
+        )
+    return response
 
 # Paths reachable with no dashboard login session: the login/bootstrap flow
 # itself, the health probe, and every agent-facing endpoint - those already
@@ -135,6 +191,14 @@ async def startup():
             "does this for you automatically) before relying on this outside local evaluation."
         )
 
+    if COUCHBASE_CONFIG["password"] == "CouchbaseDemo123!":
+        logger.warning(
+            "COUCHBASE_PASSWORD is unset - using the well-known bundled demo password. Anyone who has ever read "
+            "this project's README or .env.example knows it. Set COUCHBASE_USERNAME/COUCHBASE_PASSWORD to a real, "
+            "unique credential (PCI DSS 4.0 Req. 8.3.1 / CIS 'no default credentials') before relying on this "
+            "outside local evaluation - see .env.example."
+        )
+
     logger.info("Connecting to Couchbase...")
     await store.connect()
 
@@ -198,11 +262,30 @@ async def seed_default_admin():
     logger.info("Seeded default local account '%s' - password not yet set (first login sets it).", DEFAULT_ADMIN_USERNAME)
 
 
+def _warn_if_ldap_tls_unverified(cfg: dict) -> None:
+    """LDAPS/StartTLS with no corporate CA configured means ldap3 does not
+    validate the directory's certificate at all (see
+    user_auth.ldap_authenticate) - functionally equivalent to skipping TLS
+    verification, which leaves the bind vulnerable to an on-path MITM
+    presenting any certificate. Not escalated to a hard failure here: that
+    would break existing working deployments the moment this code shipped,
+    for admins who never had a reason to think about this. A loud warning
+    at every load/save is the honest middle ground (NIST SC-8, PCI DSS 4.0
+    Req. 4.2.1) - see also Settings -> LDAP Authentication for uploading one."""
+    if cfg.get("enabled") and (cfg.get("use_ssl") or cfg.get("start_tls")) and not (cfg.get("ca_certificate") or "").strip():
+        logger.warning(
+            "LDAP is configured for LDAPS/StartTLS but no corporate CA certificate is installed - the directory "
+            "server's certificate is NOT being validated (any certificate is accepted), which is vulnerable to an "
+            "on-path attacker. Upload your directory's CA certificate under Settings -> LDAP Authentication."
+        )
+
+
 async def load_ldap_config():
     global ldap_config
     stored = await store.get_setting(LDAP_SETTINGS_DOC)
     ldap_config = user_auth.normalize_ldap_config(stored.get("config") if stored else None)
     logger.info("LDAP config loaded (enabled=%s host=%s)", ldap_config["enabled"], ldap_config["host"] or "-")
+    _warn_if_ldap_tls_unverified(ldap_config)
 
 
 async def save_ldap_config(cfg: dict):
@@ -217,6 +300,7 @@ async def save_ldap_config(cfg: dict):
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
     )
+    _warn_if_ldap_tls_unverified(ldap_config)
 
 
 async def load_llm_config():
@@ -1356,6 +1440,27 @@ async def clear_memory_route(req: ClearMemoryRequest, authorization: str | None 
 # top of this file) then requires on every other /v1 and /api route.
 # ---------------------------------------------------------------------------
 
+def _client_ip(request: Request) -> str:
+    """Best-effort real client IP for login-lockout accounting. nginx sets
+    X-Forwarded-For (see ui/nginx.conf.template); request.client.host alone
+    would only ever show the ui container's address, since this API is
+    always reached through that reverse proxy in the bundled compose
+    stack. Only the first hop is trusted here (this app has exactly one
+    known reverse proxy in front of it) - not a general trusted-proxy chain
+    parser."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+async def _log_login_attempt(username: str, decision: str, reason: str) -> None:
+    await store.log_access(
+        action="dashboard_login", role=None, subject_label=username, query=None,
+        tool_id=None, server_id=None, decision=decision, reason=reason, latency_ms=0,
+    )
+
+
 async def _finish_login(username: str, response: Response, request: Request):
     doc = await store.get_user(username)
     if not doc:
@@ -1396,7 +1501,7 @@ async def bootstrap(req: BootstrapRequest, request: Request, response: Response)
         raise HTTPException(status_code=503, detail="Not ready yet - try again shortly.")
     if admin_doc.get("password_hash"):
         raise HTTPException(status_code=409, detail="The admin password has already been set. Use the login form.")
-    policy_error = user_auth.password_policy_error(req.password)
+    policy_error = user_auth.password_policy_error(req.password, username=DEFAULT_ADMIN_USERNAME)
     if policy_error:
         raise HTTPException(status_code=400, detail=policy_error)
 
@@ -1415,6 +1520,16 @@ async def login(req: LoginRequest, request: Request, response: Response):
     if not username or not req.password:
         raise HTTPException(status_code=400, detail="Username and password are required.")
 
+    ip = _client_ip(request)
+    locked, retry_after = user_auth.login_lockout_status(username, ip)
+    if locked:
+        await _log_login_attempt(username, "DENY", f"locked out ({retry_after}s remaining)")
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed login attempts. Try again in about {max(1, retry_after // 60)} minute(s).",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     user_doc = await store.get_user(username)
 
     if user_doc and user_doc.get("source", "local") == "local":
@@ -1424,9 +1539,14 @@ async def login(req: LoginRequest, request: Request, response: Response):
                 detail="This account has no password set yet - use the setup form instead.",
             )
         if not user_doc.get("active", True):
+            await _log_login_attempt(username, "DENY", "account disabled")
             raise HTTPException(status_code=403, detail="This account has been disabled.")
         if not user_auth.verify_password(req.password, user_doc.get("password_hash")):
+            user_auth.record_failed_login(username, ip)
+            await _log_login_attempt(username, "DENY", "invalid password")
             raise HTTPException(status_code=401, detail="Invalid username or password.")
+        user_auth.record_successful_login(username, ip)
+        await _log_login_attempt(username, "ALLOW", "local password login")
         doc = await _finish_login(username, response, request)
         return {"user": user_auth.public_user(username, doc)}
 
@@ -1435,8 +1555,11 @@ async def login(req: LoginRequest, request: Request, response: Response):
     if ldap_config.get("enabled"):
         success, detail, is_admin = await user_auth.ldap_authenticate(ldap_config, username, req.password)
         if not success:
+            user_auth.record_failed_login(username, ip)
+            await _log_login_attempt(username, "DENY", f"LDAP: {detail}")
             raise HTTPException(status_code=401, detail=detail)
         if user_doc and user_doc.get("active") is False:
+            await _log_login_attempt(username, "DENY", "account disabled")
             raise HTTPException(status_code=403, detail="This account has been disabled.")
 
         role = "admin" if is_admin else user_auth.DEFAULT_LOCAL_ROLE
@@ -1445,9 +1568,13 @@ async def login(req: LoginRequest, request: Request, response: Response):
             shadow["created_at"] = user_doc.get("created_at", shadow["created_at"])
             shadow["active"] = user_doc.get("active", True)
         await store.upsert_user(username, shadow)
+        user_auth.record_successful_login(username, ip)
+        await _log_login_attempt(username, "ALLOW", "LDAP login")
         doc = await _finish_login(username, response, request)
         return {"user": user_auth.public_user(username, doc)}
 
+    user_auth.record_failed_login(username, ip)
+    await _log_login_attempt(username, "DENY", "no such account")
     raise HTTPException(status_code=401, detail="Invalid username or password.")
 
 
@@ -1483,7 +1610,7 @@ async def change_password(req: ChangePasswordRequest, request: Request):
         raise HTTPException(status_code=400, detail="This account authenticates via LDAP - there is no local password to change.")
     if not user_auth.verify_password(req.current_password, doc.get("password_hash")):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
-    policy_error = user_auth.password_policy_error(req.new_password)
+    policy_error = user_auth.password_policy_error(req.new_password, username=username)
     if policy_error:
         raise HTTPException(status_code=400, detail=policy_error)
 
@@ -1515,7 +1642,7 @@ async def create_user(req: CreateUserRequest, request: Request):
         raise HTTPException(status_code=400, detail=f"Unknown role '{req.role}'")
     if await store.get_user(req.username):
         raise HTTPException(status_code=409, detail=f"An account named '{req.username}' already exists.")
-    policy_error = user_auth.password_policy_error(req.password)
+    policy_error = user_auth.password_policy_error(req.password, username=req.username)
     if policy_error:
         raise HTTPException(status_code=400, detail=policy_error)
 
@@ -1558,7 +1685,7 @@ async def update_user(username: str, req: UpdateUserRequest, request: Request):
     if req.password is not None:
         if doc.get("source") != "local":
             raise HTTPException(status_code=400, detail="This account authenticates via LDAP - it has no local password to set.")
-        policy_error = user_auth.password_policy_error(req.password)
+        policy_error = user_auth.password_policy_error(req.password, username=username)
         if policy_error:
             raise HTTPException(status_code=400, detail=policy_error)
         doc["password_hash"] = user_auth.hash_password(req.password)

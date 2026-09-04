@@ -55,6 +55,23 @@ SERVER_CONFIG = {
     "port": int(os.getenv("PORT", "8090")),
 }
 
+# ---------------------------------------------------------------------------
+# CORS - browser cross-origin access to the API.
+# ---------------------------------------------------------------------------
+# Empty by default: the dashboard is always served same-origin (nginx
+# proxies /v1/* and /api/* through to this service under the ui container's
+# own origin - see ui/nginx.conf.template), so no browser cross-origin
+# access to session-cookie-protected routes is actually needed out of the
+# box. Set this to a comma-separated list of exact origins
+# (e.g. "https://aom.example.com,https://ops.example.com") only if you have
+# a real reason for a *different* origin's browser JS to call this API with
+# the dashboard session cookie attached. Never combine a wildcard origin
+# with credentialed (cookie/session) access - that defeats the same-origin
+# protection the session cookie exists to provide (see main.py).
+CORS_ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+
 # How long an audit-log entry survives before Couchbase expires it. The
 # original demo used 24h; an appliance meant to run continuously gets a
 # real retention window instead (default 30 days).
