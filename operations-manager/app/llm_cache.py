@@ -513,14 +513,213 @@ def provider_catalog(api_keys: dict) -> list[dict]:
 HIT_OUTCOMES = ("hit_exact", "hit_semantic")
 
 
-def build_dashboard(events: list[dict], *, buckets: int = 12) -> dict:
-    """Aggregate the cache event stream into the LLM Caching dashboard.
-
-    Every number here is derived from events, never stored - so purging the
-    cache doesn't rewrite history, and the savings figure answers the only
-    question that matters: what did *not* get sent to a provider."""
+def build_hourly_series(hourly_events: list[dict], *, buckets: int = 12) -> list[dict]:
+    """Bucket a genuinely time-bounded RAW event list into hourly hit/miss
+    counts for the trend chart. Separated out of build_dashboard so a
+    Couchbase-aggregated caller wouldn't need to pull a raw event list at
+    all - though the live dashboard route has since moved past even that:
+    see build_dashboard_aggregate() / CouchbaseStore.
+    llm_dashboard_aggregate_since, which get the trend chart (and the
+    summary/model-breakdown panels) from one GROUP BY query instead of a
+    raw fetch, however generous its LIMIT, which silently truncates this
+    chart's window under real throughput. Kept here as the reference
+    implementation for a plain, in-hand event list (also still used by
+    build_dashboard)."""
     import datetime as _dt
 
+    now = _dt.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    hour_keys = [(now - _dt.timedelta(hours=i)) for i in range(buckets - 1, -1, -1)]
+    hourly = {h.strftime("%Y-%m-%dT%H:00:00Z"): {"hits": 0, "misses": 0} for h in hour_keys}
+    for e in hourly_events:
+        ts = e.get("timestamp") or ""
+        if len(ts) < 13:
+            continue
+        key = ts[:13] + ":00:00Z"
+        if key not in hourly:
+            continue
+        if e.get("outcome") in HIT_OUTCOMES:
+            hourly[key]["hits"] += 1
+        elif e.get("outcome") == "miss":
+            hourly[key]["misses"] += 1
+
+    return [
+        {
+            "hour": h.strftime("%H:00"),
+            "timestamp": h.strftime("%Y-%m-%dT%H:00:00Z"),
+            "hits": hourly[h.strftime("%Y-%m-%dT%H:00:00Z")]["hits"],
+            "misses": hourly[h.strftime("%Y-%m-%dT%H:00:00Z")]["misses"],
+        }
+        for h in hour_keys
+    ]
+
+
+def build_dashboard_aggregate(
+    rows: list[dict], *, trend_hours: int = 12, lifetime_by_model: dict | None = None
+) -> dict:
+    """Build the ENTIRE live dashboard payload - 'summary' (donut + stat
+    cards), 'model_breakdown' ('Savings by provider & model'), and
+    'hourly' (the trend chart) - from ONE set of pre-aggregated Couchbase
+    GROUP BY rows keyed by (hour_key, provider, model, outcome). See
+    CouchbaseStore.llm_dashboard_aggregate_since.
+
+    This replaces what used to be two functions (build_dashboard_summary
+    + build_hourly_series_from_aggregate) each consuming its own
+    full-window query - a genuinely time-bounded window (e.g. 24h) can be
+    far too many documents to fetch into Python one by one under real
+    traffic, and running three separate full-window scans for summary,
+    model breakdown, and hourly trend was needlessly rescanning the same
+    data three times. One query, reduced once here, removes that
+    redundancy - only the small, already-reduced rows cross into this
+    process.
+
+    `hour_key` is expected to be the first 13 characters of the event
+    timestamp ("%Y-%m-%dT%H:%M:%SZ" -> "%Y-%m-%dT%H"); the hourly trend
+    only uses the trailing `trend_hours` of them; the summary and
+    model_breakdown sum across every row regardless of hour, i.e. the
+    full window the query was run over.
+
+    `lifetime_by_model` (see CouchbaseStore.get_lifetime_stats), when
+    given, overrides each model_breakdown row's cost_saved_usd/
+    cost_spent_usd with the all-time total for that (provider, model) -
+    the rest of the row (requests, hit rate, tokens saved) stays
+    window-scoped. Keyed the same way CouchbaseStore._model_key builds
+    it: "<provider>::<model>"."""
+    import datetime as _dt
+
+    outcome_totals: dict[str, dict] = {}
+    model_totals: dict[tuple, dict] = {}
+
+    now = _dt.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    hour_keys = [(now - _dt.timedelta(hours=i)) for i in range(trend_hours - 1, -1, -1)]
+    hourly = {h.strftime("%Y-%m-%dT%H"): {"hits": 0, "misses": 0} for h in hour_keys}
+
+    for r in rows:
+        outcome = r.get("outcome")
+        n = int(r.get("n") or 0)
+        tokens_saved = int(r.get("tokens_saved") or 0)
+        total_tokens = int(r.get("total_tokens") or 0)
+        cost_saved_usd = float(r.get("cost_saved_usd") or 0.0)
+        cost_usd = float(r.get("cost_usd") or 0.0)
+        latency_saved_ms = int(r.get("latency_saved_ms") or 0)
+        latency_ms_sum = int(r.get("latency_ms_sum") or 0)
+
+        ot = outcome_totals.setdefault(outcome, {
+            "n": 0, "tokens_saved": 0, "cost_saved_usd": 0.0, "total_tokens": 0,
+            "cost_usd": 0.0, "latency_saved_ms": 0, "latency_ms_sum": 0,
+        })
+        ot["n"] += n
+        ot["tokens_saved"] += tokens_saved
+        ot["cost_saved_usd"] += cost_saved_usd
+        ot["total_tokens"] += total_tokens
+        ot["cost_usd"] += cost_usd
+        ot["latency_saved_ms"] += latency_saved_ms
+        ot["latency_ms_sum"] += latency_ms_sum
+
+        if outcome in HIT_OUTCOMES + ("miss",):
+            mkey = (r.get("provider") or "unknown", r.get("model") or "unknown")
+            mt = model_totals.setdefault(mkey, {
+                "requests": 0, "hits": 0, "misses": 0,
+                "tokens_saved": 0, "tokens_spent": 0,
+                "cost_saved_usd": 0.0, "cost_spent_usd": 0.0,
+            })
+            mt["requests"] += n
+            if outcome in HIT_OUTCOMES:
+                mt["hits"] += n
+                mt["tokens_saved"] += tokens_saved
+                mt["cost_saved_usd"] += cost_saved_usd
+            else:
+                mt["misses"] += n
+                mt["tokens_spent"] += total_tokens
+                mt["cost_spent_usd"] += cost_usd
+
+        hour_key = r.get("hour_key") or ""
+        if hour_key in hourly:
+            if outcome in HIT_OUTCOMES:
+                hourly[hour_key]["hits"] += n
+            elif outcome == "miss":
+                hourly[hour_key]["misses"] += n
+
+    def _n(outcome):
+        return int((outcome_totals.get(outcome) or {}).get("n") or 0)
+
+    def _sum(outcome, field):
+        return (outcome_totals.get(outcome) or {}).get(field) or 0
+
+    exact_hits = _n("hit_exact")
+    semantic_hits = _n("hit_semantic")
+    hits = exact_hits + semantic_hits
+    misses = _n("miss")
+    bypasses = _n("bypass")
+    errors = _n("error")
+    cacheable = hits + misses
+    requests = sum(v["n"] for v in outcome_totals.values())
+
+    tokens_saved = int(_sum("hit_exact", "tokens_saved")) + int(_sum("hit_semantic", "tokens_saved"))
+    cost_saved = float(_sum("hit_exact", "cost_saved_usd")) + float(_sum("hit_semantic", "cost_saved_usd"))
+    latency_saved = int(_sum("hit_exact", "latency_saved_ms")) + int(_sum("hit_semantic", "latency_saved_ms"))
+    hit_latency_sum = int(_sum("hit_exact", "latency_ms_sum")) + int(_sum("hit_semantic", "latency_ms_sum"))
+    tokens_spent = int(_sum("miss", "total_tokens"))
+    cost_spent = float(_sum("miss", "cost_usd"))
+    miss_latency_sum = int(_sum("miss", "latency_ms_sum"))
+
+    summary = {
+        "requests": requests,
+        "cacheable_requests": cacheable,
+        "hits": hits,
+        "exact_hits": exact_hits,
+        "semantic_hits": semantic_hits,
+        "misses": misses,
+        "bypasses": bypasses,
+        "errors": errors,
+        "hit_rate_pct": round((hits / cacheable) * 100, 1) if cacheable else 0.0,
+        "tokens_saved": tokens_saved,
+        "tokens_spent": tokens_spent,
+        "cost_saved_usd": round(cost_saved, 4),
+        "cost_spent_usd": round(cost_spent, 4),
+        "latency_saved_ms": latency_saved,
+        "avg_hit_latency_ms": round(hit_latency_sum / hits) if hits else 0,
+        "avg_miss_latency_ms": round(miss_latency_sum / misses) if misses else 0,
+    }
+
+    lifetime_by_model = lifetime_by_model or {}
+    breakdown = []
+    for (provider, model), row in model_totals.items():
+        row = dict(
+            row, provider=provider, model=model,
+            provider_label=PROVIDERS.get(provider, {}).get("label", provider),
+        )
+        row["hit_rate_pct"] = round((row["hits"] / row["requests"]) * 100, 1) if row["requests"] else 0.0
+        lifetime_row = lifetime_by_model.get(f"{provider}::{model}")
+        if lifetime_row:
+            row["cost_saved_usd"] = round(float(lifetime_row.get("cost_saved_usd_total") or 0.0), 4)
+            row["cost_spent_usd"] = round(float(lifetime_row.get("cost_spent_usd_total") or 0.0), 4)
+        else:
+            row["cost_saved_usd"] = round(row["cost_saved_usd"], 4)
+            row["cost_spent_usd"] = round(row["cost_spent_usd"], 4)
+        breakdown.append(row)
+    breakdown.sort(key=lambda r: r["tokens_saved"], reverse=True)
+
+    hourly_series = [
+        {
+            "hour": h.strftime("%H:00"),
+            "timestamp": h.strftime("%Y-%m-%dT%H:00:00Z"),
+            "hits": hourly[h.strftime("%Y-%m-%dT%H")]["hits"],
+            "misses": hourly[h.strftime("%Y-%m-%dT%H")]["misses"],
+        }
+        for h in hour_keys
+    ]
+
+    return {"summary": summary, "model_breakdown": breakdown, "hourly": hourly_series}
+
+
+def build_dashboard(events: list[dict], *, buckets: int = 12, hourly_events: list[dict] | None = None) -> dict:
+    """Aggregate a raw cache event list into the LLM Caching dashboard
+    shape. Superseded for the live dashboard route by
+    build_dashboard_aggregate() (see main.py / CouchbaseStore.
+    llm_dashboard_aggregate_since), which gets everything from one
+    Couchbase GROUP BY instead of pulling a potentially huge raw event
+    list into Python - kept here as the reference implementation for a
+    plain, count-bounded event list."""
     hits = [e for e in events if e.get("outcome") in HIT_OUTCOMES]
     misses = [e for e in events if e.get("outcome") == "miss"]
     bypasses = [e for e in events if e.get("outcome") == "bypass"]
@@ -537,20 +736,7 @@ def build_dashboard(events: list[dict], *, buckets: int = 12) -> dict:
         vals = [int(r.get(key) or 0) for r in rows]
         return round(sum(vals) / len(vals)) if vals else 0
 
-    now = _dt.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-    hour_keys = [(now - _dt.timedelta(hours=i)) for i in range(buckets - 1, -1, -1)]
-    hourly = {h.strftime("%Y-%m-%dT%H:00:00Z"): {"hits": 0, "misses": 0} for h in hour_keys}
-    for e in events:
-        ts = e.get("timestamp") or ""
-        if len(ts) < 13:
-            continue
-        key = ts[:13] + ":00:00Z"
-        if key not in hourly:
-            continue
-        if e.get("outcome") in HIT_OUTCOMES:
-            hourly[key]["hits"] += 1
-        elif e.get("outcome") == "miss":
-            hourly[key]["misses"] += 1
+    hourly = build_hourly_series(hourly_events if hourly_events is not None else events, buckets=buckets)
 
     by_model: dict[tuple, dict] = {}
     for e in events:
@@ -602,14 +788,6 @@ def build_dashboard(events: list[dict], *, buckets: int = 12) -> dict:
             "avg_hit_latency_ms": _avg(hits, "latency_ms"),
             "avg_miss_latency_ms": _avg(misses, "latency_ms"),
         },
-        "hourly": [
-            {
-                "hour": h.strftime("%H:00"),
-                "timestamp": h.strftime("%Y-%m-%dT%H:00:00Z"),
-                "hits": hourly[h.strftime("%Y-%m-%dT%H:00:00Z")]["hits"],
-                "misses": hourly[h.strftime("%Y-%m-%dT%H:00:00Z")]["misses"],
-            }
-            for h in hour_keys
-        ],
+        "hourly": hourly,
         "model_breakdown": breakdown,
     }

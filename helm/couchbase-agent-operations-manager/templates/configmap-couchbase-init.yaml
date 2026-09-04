@@ -98,4 +98,20 @@ data:
         -d "statement=CREATE PRIMARY INDEX IF NOT EXISTS ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`${COLLECTION}\`" > /dev/null || true
     done
 
+    # Secondary index on llm_cache_log.timestamp - both the LLM Caching
+    # dashboard's fixed-count "recent events" query and its time-bounded
+    # "last 12h" trend-chart query filter/sort on this field - see
+    # app/couchbase_client.py's recent_llm_events()/recent_llm_events_since()
+    # in the main repo (kept in sync with couchbase-init/init.sh manually).
+    curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+      -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_timestamp ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp)" > /dev/null || true
+
+    # Covering index for the LLM Caching dashboard's aggregate query (see
+    # app/couchbase_client.py's llm_dashboard_aggregate_since in the main
+    # repo, kept in sync with couchbase-init/init.sh manually) - lets the
+    # dashboard's single GROUP BY over the last 24h run as a pure index
+    # scan instead of a per-document KV fetch for every matching event.
+    curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+      -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_agg ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, outcome, provider, model, tokens_saved, total_tokens, cost_saved_usd, cost_usd, latency_saved_ms, latency_ms)" > /dev/null || true
+
     echo "[couchbase-init] Couchbase provisioning complete."

@@ -23,8 +23,15 @@ import numpy as np
 import requests
 from couchbase.auth import PasswordAuthenticator
 from couchbase.cluster import Cluster
-from couchbase.exceptions import DocumentNotFoundException
-from couchbase.options import ClusterOptions, ClusterTimeoutOptions, QueryOptions, SearchOptions, UpsertOptions
+from couchbase.exceptions import CasMismatchException, DocumentNotFoundException
+from couchbase.options import (
+    ClusterOptions,
+    ClusterTimeoutOptions,
+    QueryOptions,
+    ReplaceOptions,
+    SearchOptions,
+    UpsertOptions,
+)
 import couchbase.search as cb_search
 from couchbase.vector_search import VectorQuery as CBVectorQuery, VectorSearch as CBVectorSearch
 
@@ -712,7 +719,15 @@ class CouchbaseStore:
                 "semantic_hits", "tokens_saved", "cost_saved_usd", "origin_latency_ms",
                 "config_version", "catalog_version", "override", "stub",
             ]
-            fields = ", ".join(f"c.{f}" for f in field_names)
+            # Backtick-escape every field, not just `namespace` - it's the
+            # one that's a N1QL reserved word today (this exact query used
+            # to fail outright with "syntax error ... namespace (reserved
+            # word)"), but escaping all of them is cheap insurance against
+            # any future field name that collides with a future reserved
+            # word. Escaping doesn't change the result set's field names -
+            # N1QL's implicit alias for `c.\`namespace\`` is still
+            # "namespace", so nothing downstream needs to change.
+            fields = ", ".join(f"c.`{f}`" for f in field_names)
             q = (
                 f"SELECT {fields} FROM `{bucket}`.`{scope}`.`{coll}` c "
                 f"ORDER BY c.created_at DESC LIMIT $limit"
@@ -742,7 +757,11 @@ class CouchbaseStore:
             clauses.append("c.model = $model")
             params["model"] = model
         if namespace:
-            clauses.append("c.namespace = $namespace")
+            # Backtick-escaped: `namespace` is a N1QL reserved word - see
+            # the matching fix/comment on list_cache_entries() above,
+            # which hit the identical "syntax error ... namespace
+            # (reserved word)" failure.
+            clauses.append("c.`namespace` = $namespace")
             params["namespace"] = namespace
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
 
@@ -832,6 +851,52 @@ class CouchbaseStore:
             logger.warning("recent_llm_events query failed: %s", exc)
             return []
 
+    async def llm_dashboard_aggregate_since(self, since: str) -> list[dict]:
+        """One GROUP BY query - by (hour, provider, model, outcome) - that
+        supplies everything the LLM Caching dashboard needs: the 24h
+        summary/donut, the 'Savings by provider & model' breakdown, and
+        (via the trailing N hours of hour buckets) the trend chart. See
+        llm_cache.build_dashboard_aggregate for how the rows are reduced
+        into those three shapes.
+
+        This replaces three separate full-window GROUP BY queries that
+        used to run on every dashboard load/30s auto-refresh (one for
+        per-outcome sums, one for per-model sums, one for per-hour
+        counts) - each rescanning largely the same 24h of events. At real
+        throughput (~230k+ events/24h observed) that was three ~230k-row
+        scans instead of one, a meaningful chunk of the multi-second page
+        load. A single query, reduced once in Python, removes that
+        redundancy.
+
+        Groups by the first 13 characters of the "%Y-%m-%dT%H:%M:%SZ"
+        timestamp string (e.g. "2026-09-04T10") for the hour dimension -
+        see idx_llm_cache_log_agg (couchbase-init/init.sh) for the
+        covering index that lets this run as a pure index scan rather
+        than a per-document KV fetch for every matching event."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["llm_cache_log_collection"]
+
+        def _run():
+            q = (
+                f"SELECT SUBSTR(e.timestamp, 0, 13) AS hour_key, e.provider AS provider, "
+                f"e.model AS model, e.outcome AS outcome, COUNT(1) AS n, "
+                f"SUM(e.tokens_saved) AS tokens_saved, SUM(e.total_tokens) AS total_tokens, "
+                f"SUM(e.cost_saved_usd) AS cost_saved_usd, SUM(e.cost_usd) AS cost_usd, "
+                f"SUM(e.latency_saved_ms) AS latency_saved_ms, SUM(e.latency_ms) AS latency_ms_sum "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` e "
+                f"WHERE e.timestamp >= $since "
+                f"GROUP BY SUBSTR(e.timestamp, 0, 13), e.provider, e.model, e.outcome"
+            )
+            return list(self.cluster.query(
+                q, QueryOptions(named_parameters={"since": since}, metrics=False)
+            ).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("llm_dashboard_aggregate_since query failed: %s", exc)
+            return []
+
     # -- Settings (user-editable runtime policy) -------------------------------
 
     async def get_setting(self, doc_id: str) -> dict | None:
@@ -852,6 +917,153 @@ class CouchbaseStore:
             await asyncio.to_thread(self.settings.upsert, doc_id, doc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("upsert_setting(%s) failed: %s", doc_id, exc)
+
+    # -- LLM cache lifetime stats -------------------------------------------
+    #
+    # The dashboard's headline "tokens saved" / "cost saved" summary is
+    # deliberately derived from `events` (see build_dashboard) - a
+    # fixed-count, TTL-bounded window, so it plateaus once traffic outruns
+    # that window. These two counters are the answer to a different
+    # question - "how much has this cache saved, ever?" - and live in a
+    # single settings document that is never windowed and never expires,
+    # updated with a CAS retry loop so concurrent requests can't clobber
+    # each other's increments.
+
+    _LIFETIME_STATS_DOC_ID = "llm_lifetime_stats"
+
+    @staticmethod
+    def _model_key(provider: str | None, model: str | None) -> str:
+        return f"{provider or 'unknown'}::{model or 'unknown'}"
+
+    def _bootstrap_lifetime_stats(self) -> dict:
+        """First-touch initialization: sum whatever cache-hit/miss history
+        is still live in Couchbase (bounded by the event log's own TTL) so
+        the counters start from something sensible instead of visibly
+        dropping to zero the moment this feature is deployed. Only ever
+        runs once - after the settings document exists, every call just
+        increments it.
+
+        Populates both the top-level all-time totals (tokens/cost saved,
+        never windowed - see the dashboard's "Total ..." stat cards) and a
+        per (provider, model) breakdown (cost saved/spent - see the
+        'Savings by provider & model' table's Cost saved / Cost spent
+        columns, which show all-time amounts rather than the 24h window
+        the rest of that table uses)."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["llm_cache_log_collection"]
+        baseline_tokens = 0
+        baseline_cost_saved = 0.0
+        by_model: dict[str, dict] = {}
+        try:
+            q = (
+                f"SELECT e.provider AS provider, e.model AS model, e.outcome AS outcome, "
+                f"SUM(e.tokens_saved) AS tokens_saved, SUM(e.cost_saved_usd) AS cost_saved_usd, "
+                f"SUM(e.cost_usd) AS cost_usd "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` e "
+                f"WHERE e.outcome IN ['hit_exact', 'hit_semantic', 'miss'] "
+                f"GROUP BY e.provider, e.model, e.outcome"
+            )
+            for row in self.cluster.query(q, QueryOptions(metrics=False)).rows():
+                key = self._model_key(row.get("provider"), row.get("model"))
+                entry = by_model.setdefault(key, {"cost_saved_usd_total": 0.0, "cost_spent_usd_total": 0.0})
+                if row.get("outcome") in ("hit_exact", "hit_semantic"):
+                    baseline_tokens += int(row.get("tokens_saved") or 0)
+                    cost_saved = float(row.get("cost_saved_usd") or 0.0)
+                    baseline_cost_saved += cost_saved
+                    entry["cost_saved_usd_total"] += cost_saved
+                elif row.get("outcome") == "miss":
+                    entry["cost_spent_usd_total"] += float(row.get("cost_usd") or 0.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lifetime stats bootstrap scan failed, starting from zero: %s", exc)
+        for entry in by_model.values():
+            entry["cost_saved_usd_total"] = round(entry["cost_saved_usd_total"], 6)
+            entry["cost_spent_usd_total"] = round(entry["cost_spent_usd_total"], 6)
+        doc = {
+            "doc_type": "llm_lifetime_stats",
+            "tokens_saved_total": baseline_tokens,
+            "cost_saved_usd_total": round(baseline_cost_saved, 6),
+            "by_model": by_model,
+        }
+        try:
+            self.settings.insert(self._LIFETIME_STATS_DOC_ID, doc)
+        except Exception:
+            # Someone else bootstrapped it concurrently - use whatever they wrote.
+            try:
+                return self.settings.get(self._LIFETIME_STATS_DOC_ID).content_as[dict]
+            except Exception:  # noqa: BLE001
+                pass
+        return doc
+
+    async def get_lifetime_stats(self) -> dict:
+        doc = await self.get_setting(self._LIFETIME_STATS_DOC_ID)
+        if doc is not None:
+            return doc
+        try:
+            return await asyncio.to_thread(self._bootstrap_lifetime_stats)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("get_lifetime_stats bootstrap failed: %s", exc)
+            return {"tokens_saved_total": 0, "cost_saved_usd_total": 0.0, "by_model": {}}
+
+    async def increment_lifetime_stats(
+        self,
+        *,
+        tokens_saved_delta: int = 0,
+        cost_saved_delta: float = 0.0,
+        cost_spent_delta: float = 0.0,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> dict:
+        """Atomically fold a single request's outcome into the all-time
+        counters. Hits pass tokens_saved_delta/cost_saved_delta; genuine
+        misses (not bypasses) pass cost_spent_delta - both also update the
+        per (provider, model) entry keyed by `provider`/`model` so the
+        'Savings by provider & model' table's Cost saved/Cost spent columns
+        can show all-time totals. CAS retry loop since concurrent requests
+        hit this at once."""
+        if not tokens_saved_delta and not cost_saved_delta and not cost_spent_delta:
+            return await self.get_lifetime_stats()
+        model_key = self._model_key(provider, model) if (provider or model) else None
+
+        def _apply_delta(doc: dict) -> dict:
+            doc["tokens_saved_total"] = int(doc.get("tokens_saved_total") or 0) + tokens_saved_delta
+            doc["cost_saved_usd_total"] = round(
+                float(doc.get("cost_saved_usd_total") or 0.0) + cost_saved_delta, 6
+            )
+            if model_key:
+                by_model = doc.setdefault("by_model", {})
+                entry = by_model.setdefault(model_key, {"cost_saved_usd_total": 0.0, "cost_spent_usd_total": 0.0})
+                entry["cost_saved_usd_total"] = round(
+                    float(entry.get("cost_saved_usd_total") or 0.0) + cost_saved_delta, 6
+                )
+                entry["cost_spent_usd_total"] = round(
+                    float(entry.get("cost_spent_usd_total") or 0.0) + cost_spent_delta, 6
+                )
+            return doc
+
+        def _apply():
+            for _ in range(8):
+                try:
+                    res = self.settings.get(self._LIFETIME_STATS_DOC_ID)
+                    doc = _apply_delta(res.content_as[dict])
+                    self.settings.replace(self._LIFETIME_STATS_DOC_ID, doc, ReplaceOptions(cas=res.cas))
+                    return doc
+                except DocumentNotFoundException:
+                    seed = _apply_delta(self._bootstrap_lifetime_stats())
+                    try:
+                        self.settings.replace(self._LIFETIME_STATS_DOC_ID, seed)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return seed
+                except CasMismatchException:
+                    continue
+            logger.warning("increment_lifetime_stats: giving up after CAS retries")
+            return {}
+
+        try:
+            return await asyncio.to_thread(_apply)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("increment_lifetime_stats failed: %s", exc)
+            return {}
 
     # -- Agent memory ------------------------------------------------------
     #

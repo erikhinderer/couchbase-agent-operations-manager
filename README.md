@@ -178,6 +178,16 @@ LLM caching is on by default and needs no API key to try - see
 `docker compose down -v` gives you a fully clean start (drops the
 Couchbase and embedding-model-cache volumes).
 
+**Running this on Kubernetes instead?** See
+[helm/couchbase-agent-operations-manager](./helm/couchbase-agent-operations-manager)
+for a Helm chart covering the same five-piece topology (Couchbase as a
+StatefulSet, provisioning as a Job instead of docker-compose.yml's
+always-on init container, the sample MCP servers, operations-manager, and
+the dashboard) - read that chart's README first, in particular "Before you
+install": the three custom images have to be built and pushed to a
+registry your cluster can reach before `helm install` will do anything but
+ImagePullBackOff.
+
 ## HTTPS / TLS
 
 The dashboard (nginx, published on the standard HTTPS port 443) and the Operations Manager API

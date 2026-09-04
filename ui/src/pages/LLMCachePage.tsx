@@ -27,6 +27,18 @@ function duration(ms: number): string {
   return `${ms} ms`;
 }
 
+// "Latency Avoided" can run into weeks' worth of milliseconds under
+// sustained traffic - minutes alone gets unreadable fast, so switch to
+// hours past the 24h mark, then a compact "###.#k hrs" once that would
+// otherwise be a 4+ digit hour count.
+function formatLatencyAvoided(ms: number): string {
+  const minutes = ms / 60_000;
+  if (minutes < 1440) return `${minutes.toFixed(1)} min`;
+  const hours = ms / 3_600_000;
+  if (hours >= 1000) return `${(hours / 1000).toFixed(1)}k hrs`;
+  return `${hours.toFixed(1)} hrs`;
+}
+
 function OutcomeBadge({ outcome }: { outcome: string }) {
   const cls =
     outcome === "hit_exact" || outcome === "hit_semantic"
@@ -118,7 +130,7 @@ export function LLMCachePage() {
           <h1 className="page-title">LLM Cache Dashboard</h1>
           <p className="page-subtitle">
             {data
-              ? `${data.events_examined} cache event(s) examined - serving ${data.provider_label} (${data.model})${
+              ? `${data.events_examined} request(s) in the last 24h - serving ${data.provider_label} (${data.model})${
                   data.api_key_configured ? "" : " in offline stub mode"
                 }`
               : "Loading..."}
@@ -149,14 +161,14 @@ export function LLMCachePage() {
         <>
           <div className="stat-grid">
             <StatCard
-              label="Tokens Saved"
-              value={compactNumber(s.tokens_saved)}
-              hint={`${compactNumber(s.tokens_spent)} tokens still billed on misses`}
+              label="Total Tokens Saved"
+              value={compactNumber(data.tokens_saved_total)}
+              hint={`${compactNumber(s.tokens_spent)} tokens still billed on misses (last 24h)`}
             />
             <StatCard
-              label="Estimated Cost Saved"
-              value={usd(s.cost_saved_usd)}
-              hint={`${usd(s.cost_spent_usd)} spent on provider calls`}
+              label="Total Estimated Cost Saved"
+              value={usd(data.cost_saved_usd_total)}
+              hint={`${usd(s.cost_spent_usd)} spent on provider calls (last 24h)`}
             />
             <StatCard
               label="Cache Hit Rate"
@@ -165,7 +177,7 @@ export function LLMCachePage() {
             />
             <StatCard
               label="Latency Avoided"
-              value={duration(s.latency_saved_ms)}
+              value={formatLatencyAvoided(s.latency_saved_ms)}
               hint={`${s.avg_hit_latency_ms}ms per hit vs ${s.avg_miss_latency_ms}ms per miss`}
             />
           </div>
@@ -189,7 +201,7 @@ export function LLMCachePage() {
               />
             </div>
             <div className="card">
-              <h3 className="card-title">How requests were resolved</h3>
+              <h3 className="card-title">How requests were resolved (last 24hrs)</h3>
               <DonutChart
                 segments={[
                   { label: "Exact hit", value: s.exact_hits, color: HIT_COLOR },
@@ -203,7 +215,7 @@ export function LLMCachePage() {
           </div>
 
           <div className="flex-between" style={{ marginBottom: 14 }}>
-            <h2 style={{ fontSize: 16, margin: 0 }}>Savings by provider &amp; model</h2>
+            <h2 style={{ fontSize: 16, margin: 0 }}>Savings by provider &amp; model (last 24hrs)</h2>
             <span className="cell-muted" style={{ fontSize: 12 }}>
               Cost figures are list-price estimates, not billing data
             </span>
@@ -224,8 +236,8 @@ export function LLMCachePage() {
                       <th>Requests</th>
                       <th>Hit rate</th>
                       <th>Tokens saved</th>
-                      <th>Cost saved</th>
-                      <th>Cost spent</th>
+                      <th>Total cost saved</th>
+                      <th>Total cost spent</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -250,8 +262,7 @@ export function LLMCachePage() {
             <h2 style={{ fontSize: 16, margin: 0 }}>
               Cached entries{" "}
               <span className="cell-muted" style={{ fontWeight: 400, fontSize: 13 }}>
-                ({data.cached_entries}
-                {data.max_entries ? ` of max ${data.max_entries}` : ""})
+                ({data.cached_entries})
               </span>
             </h2>
             <div className="flex-row">
@@ -268,7 +279,7 @@ export function LLMCachePage() {
             <div className="card empty-state">The cache is empty.</div>
           ) : (
             <div className="card" style={{ marginBottom: 24 }}>
-              <div className="table-wrap">
+              <div className="table-wrap scroll" style={{ maxHeight: 620 }}>
                 <table className="data-table">
                   <thead>
                     <tr>
@@ -331,7 +342,7 @@ export function LLMCachePage() {
             <div className="card empty-state">No cache events in the current retention window.</div>
           ) : (
             <div className="card">
-              <div className="table-wrap">
+              <div className="table-wrap scroll" style={{ maxHeight: 460 }}>
                 <table className="data-table">
                   <thead>
                     <tr>

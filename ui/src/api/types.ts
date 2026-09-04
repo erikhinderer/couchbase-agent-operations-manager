@@ -276,6 +276,8 @@ export interface LLMModelBreakdownRow {
 export interface LLMDashboardResponse {
   generated_at: string;
   events_examined: number;
+  tokens_saved_total: number;
+  cost_saved_usd_total: number;
   enabled: boolean;
   provider: string;
   provider_label: string;

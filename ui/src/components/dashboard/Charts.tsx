@@ -1,5 +1,11 @@
 /** Small dependency-free SVG charts, styled to match the appliance's theme. */
 
+function compactNumber(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
 export function BarChart({
   data,
   labelKey = "label",
@@ -114,7 +120,7 @@ export function DonutChart({
               );
             })}
         <text x="50" y="47" textAnchor="middle" fontSize="15" fontWeight={700} fill="var(--text)">
-          {total}
+          {compactNumber(total)}
         </text>
         <text x="50" y="60" textAnchor="middle" fontSize="7" fill="var(--text-faint)">
           total
@@ -125,7 +131,7 @@ export function DonutChart({
           <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}>
             <span style={{ width: 9, height: 9, borderRadius: 2, background: s.color, display: "inline-block" }} />
             <span style={{ color: "var(--text-muted)" }}>{s.label}</span>
-            <span style={{ marginLeft: "auto", fontWeight: 700 }}>{s.value}</span>
+            <span style={{ marginLeft: "auto", fontWeight: 700 }}>{compactNumber(s.value)}</span>
           </div>
         ))}
       </div>

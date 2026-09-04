@@ -613,6 +613,17 @@ code,
   overflow-x: auto;
 }
 
+.table-wrap.scroll {
+  overflow-y: auto;
+}
+
+.table-wrap.scroll thead th {
+  position: sticky;
+  top: 0;
+  background: var(--card-bg);
+  z-index: 1;
+}
+
 table.data-table {
   width: 100%;
   border-collapse: collapse;

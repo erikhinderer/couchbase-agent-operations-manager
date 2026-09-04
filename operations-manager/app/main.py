@@ -48,7 +48,6 @@ from config import (
     LDAP_SETTINGS_DOC,
     LLM_API_KEYS,
     LLM_CACHE_DEFAULTS,
-    LLM_CACHE_LOOKBACK_ENTRIES,
     SAMPLE_MCP_SERVERS_BASE_URL,
     SEED_API_KEYS,
 )
@@ -1003,6 +1002,16 @@ async def llm_complete(req: LLMCompleteRequest, authorization: str | None = Head
             updated = await _record_cache_hit(hit, cfg, similarity is not None)
             saved_ms = max(0, int(hit.get("origin_latency_ms") or 0) - latency_ms)
             outcome = "hit_semantic" if similarity is not None else "hit_exact"
+            # All-time counters (never windowed, never expire) - see
+            # CouchbaseStore.increment_lifetime_stats for why the dashboard's
+            # headline savings figures, and the per-model Cost saved/Cost
+            # spent columns, need a separate, non-plateauing source.
+            await store.increment_lifetime_stats(
+                tokens_saved_delta=int(hit.get("total_tokens", 0) or 0),
+                cost_saved_delta=float(hit.get("cost_usd", 0.0) or 0.0),
+                provider=provider,
+                model=model,
+            )
             await store.log_llm_event({
                 "doc_type": "llm_cache_event",
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1078,6 +1087,7 @@ async def llm_complete(req: LLMCompleteRequest, authorization: str | None = Head
             prompt_tokens, completion_tokens, cost_usd, latency_ms,
             override=(provider != cfg["provider"] or model != cfg["model"]),
         )
+        await store.increment_lifetime_stats(cost_spent_delta=cost_usd, provider=provider, model=model)
 
     await store.log_llm_event({
         "doc_type": "llm_cache_event",
@@ -1277,12 +1287,37 @@ async def delete_llm_cache_entry(entry_id: str):
 
 @app.get("/v1/llm/dashboard")
 async def llm_dashboard():
-    events = await store.recent_llm_events(limit=LLM_CACHE_LOOKBACK_ENTRIES)
-    data = llm_cache.build_dashboard(events, buckets=12)
+    # All-time totals - never windowed, never reset by the event log's TTL.
+    # See CouchbaseStore.increment_lifetime_stats/get_lifetime_stats. Fetched
+    # first so its per-model breakdown can feed the aggregate below.
+    lifetime = await store.get_lifetime_stats()
+
+    # ONE GROUP BY query covers the 24h summary/donut, the "Savings by
+    # provider & model" breakdown, AND (via its trailing 12h of hour
+    # buckets) the trend chart - see CouchbaseStore.
+    # llm_dashboard_aggregate_since / llm_cache.build_dashboard_aggregate
+    # for why three separate full-window scans became one. Also runs as a
+    # pure index scan (no per-document KV fetch) via idx_llm_cache_log_agg
+    # (couchbase-init/init.sh) - at real throughput (~230k+ events/24h)
+    # that combination is most of what made this route slow.
+    window_hours = 24
+    trend_hours = 12
+    window_since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - window_hours * 3600))
+    agg_rows = await store.llm_dashboard_aggregate_since(window_since)
+    dashboard_data = llm_cache.build_dashboard_aggregate(
+        agg_rows, trend_hours=trend_hours, lifetime_by_model=lifetime.get("by_model")
+    )
+
+    # "Recent cache events" just shows the most recent individual events -
+    # a small, fixed-count fetch, independent of the aggregate above.
+    recent_events = await store.recent_llm_events(limit=50)
+
     provider_spec = llm_cache.PROVIDERS[llm_config["provider"]]
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "events_examined": len(events),
+        "events_examined": dashboard_data["summary"]["requests"],
+        "tokens_saved_total": int(lifetime.get("tokens_saved_total") or 0),
+        "cost_saved_usd_total": round(float(lifetime.get("cost_saved_usd_total") or 0.0), 4),
         "enabled": llm_config["enabled"],
         "provider": llm_config["provider"],
         "provider_label": provider_spec["label"],
@@ -1294,10 +1329,10 @@ async def llm_dashboard():
         "cached_entries": await store.count_cache_entries(),
         "max_entries": llm_config["max_entries"],
         "last_sweep_at": last_llm_sweep_at,
-        "summary": data["summary"],
-        "hourly": data["hourly"],
-        "model_breakdown": data["model_breakdown"],
-        "recent_events": events[:50],
+        "summary": dashboard_data["summary"],
+        "hourly": dashboard_data["hourly"],
+        "model_breakdown": dashboard_data["model_breakdown"],
+        "recent_events": recent_events,
     }
 
 

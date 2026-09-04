@@ -105,6 +105,30 @@ for COLLECTION in servers tools identities access_log llm_cache llm_cache_log se
     -d "statement=CREATE PRIMARY INDEX IF NOT EXISTS ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`${COLLECTION}\`" > /dev/null || true
 done
 
+# Secondary index on llm_cache_log.timestamp - both the LLM Caching
+# dashboard's fixed-count "recent events" query (ORDER BY timestamp DESC
+# LIMIT N) and its time-bounded "last 12h" trend-chart query (WHERE
+# timestamp >= $since) filter/sort on this field, and without this index
+# each falls back to a full primary-index scan that gets slower as
+# llm_cache_log grows - see app/couchbase_client.py's recent_llm_events()
+# and recent_llm_events_since().
+curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+  -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_timestamp ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp)" > /dev/null || true
+
+# Covering index for the LLM Caching dashboard's aggregate query (see
+# app/couchbase_client.py's llm_dashboard_aggregate_since) - one GROUP BY
+# over the last 24h that supplies the summary/donut, the per-model
+# breakdown, and the hourly trend chart in a single scan. Without every
+# field the query touches present here, N1QL can only use the plain
+# timestamp index above to find matching keys and then has to fetch the
+# full document from KV for each one to read outcome/tokens_saved/etc -
+# at real throughput (200k+ events/day) that's 200k+ random KV fetches on
+# every dashboard load or 30s auto-refresh, which is what made the page
+# take multiple seconds to load. Listing every referenced field here lets
+# the same query run as a pure index scan instead.
+curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+  -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_agg ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, outcome, provider, model, tokens_saved, total_tokens, cost_saved_usd, cost_usd, latency_saved_ms, latency_ms)" > /dev/null || true
+
 echo "[couchbase-init] Couchbase provisioning complete."
 
 # Provisioning is idempotent and safe to re-run, so rather than exiting
