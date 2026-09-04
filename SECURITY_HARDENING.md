@@ -8,18 +8,6 @@ each change to the control families in CIS Benchmarks, NIST SP 800-53 /
 SP 800-123, DISA STIG control objectives, and PCI DSS v4.0 that it
 addresses.
 
-**What this document is not.** It is not a compliance certificate, an
-attestation, or a substitute for a formal assessment. CIS Benchmark
-scoring, DISA STIG compliance, and PCI DSS attestation are all produced by
-running specific tooling (CIS-CAT, DISA's SCC/STIG Viewer) or a qualified
-assessor (a PCI QSA) against a *deployed* system, and they also cover a
-lot of ground - physical security, personnel policy, incident response,
-vulnerability management process, network segmentation of the broader
-environment this appliance is deployed into - that no amount of source
-code can satisfy on its own. What follows is an honest account of what
-changed in this repository, why, and what is deliberately left as a
-documented gap rather than silently ignored.
-
 ## Summary
 
 | Area | Change | Standards touched |
