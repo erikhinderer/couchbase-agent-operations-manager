@@ -158,7 +158,7 @@ export function RolesPage() {
                                 </div>
                               </td>
                               <td>
-                                <SeverityBadge severity={t.risk_level} />
+                                <SeverityBadge severity={t.risk_level} displayAs={{ critical: "high" }} />
                               </td>
                               <td>
                                 <TrustBadge trust={t.trust_status} />

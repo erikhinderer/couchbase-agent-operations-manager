@@ -9,6 +9,7 @@ export function AuditLogPage() {
   const [error, setError] = useState<string | null>(null);
   const [actionFilter, setActionFilter] = useState("all");
   const [decisionFilter, setDecisionFilter] = useState("all");
+  const [roleFilter, setRoleFilter] = useState("all");
   const [live, setLive] = useState(true);
   const [limit, setLimit] = useState(100);
 
@@ -35,8 +36,15 @@ export function AuditLogPage() {
   const filtered = (entries || []).filter((e) => {
     if (actionFilter !== "all" && e.action !== actionFilter) return false;
     if (decisionFilter !== "all" && e.decision !== decisionFilter) return false;
+    if (roleFilter !== "all" && e.role !== roleFilter) return false;
     return true;
   });
+
+  // Distinct roles actually present in the currently-loaded page of
+  // entries, not a hardcoded list -- so a custom role registered later
+  // (Servers page / POST /v1/servers-adjacent role additions) shows up
+  // here automatically instead of silently having no way to filter on it.
+  const roleOptions = Array.from(new Set((entries || []).map((e) => e.role).filter((r): r is string => !!r))).sort();
 
   return (
     <div>
@@ -83,6 +91,18 @@ export function AuditLogPage() {
           <option value="ALLOW">ALLOW</option>
           <option value="DENY">DENY</option>
           <option value="ERROR">ERROR</option>
+        </select>
+        <select
+          value={roleFilter}
+          onChange={(e) => setRoleFilter(e.target.value)}
+          style={{ background: "var(--bg-elevated)", border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px" }}
+        >
+          <option value="all">All roles</option>
+          {roleOptions.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
         </select>
         <select
           value={limit}

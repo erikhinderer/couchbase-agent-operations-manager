@@ -157,7 +157,7 @@ export function AgentToolAuditPage() {
                 >
                   <div className="flex-between">
                     <div style={{ fontWeight: 600 }}>{t.name}</div>
-                    <SeverityBadge severity={t.risk_level} />
+                    <SeverityBadge severity={t.risk_level} displayAs={{ critical: "high" }} />
                   </div>
                   <div className="cell-muted" style={{ margin: "6px 0" }}>
                     {t.description}
