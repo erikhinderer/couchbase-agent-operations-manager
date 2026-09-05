@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../api/client";
 import type { AuditLogEntry } from "../api/types";
 import { DecisionBadge } from "../components/badges/Badges";
+import { SiemForwardingPanel } from "../components/siem/SiemForwardingPanel";
 
 export function AuditLogPage() {
   const [entries, setEntries] = useState<AuditLogEntry[] | null>(null);
@@ -59,6 +60,8 @@ export function AuditLogPage() {
       </div>
 
       {error && <div className="error-note">{error}</div>}
+
+      <SiemForwardingPanel />
 
       <div className="flex-row" style={{ marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
         <select

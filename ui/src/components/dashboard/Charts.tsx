@@ -115,7 +115,6 @@ export function DonutChart({
                   strokeDasharray={`${dash} ${gap}`}
                   strokeLinecap="butt"
                   transform={`rotate(${rotation} 50 50)`}
-                  opacity={0.92}
                 />
               );
             })}

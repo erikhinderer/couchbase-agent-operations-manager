@@ -21,6 +21,8 @@ from datetime import timedelta
 
 import numpy as np
 import requests
+
+from app import siem_forwarding
 from couchbase.auth import PasswordAuthenticator
 from couchbase.cluster import Cluster
 from couchbase.exceptions import CasMismatchException, DocumentNotFoundException
@@ -48,6 +50,22 @@ logger = logging.getLogger("operations-manager.couchbase")
 def hash_key(api_key: str) -> str:
     """Never store raw API keys as document IDs - hash them instead."""
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+# SIEM/log-forwarding provider hook - set once at startup (main.py) so
+# log_access() below can schedule a background forward without importing
+# main.py itself (avoids a circular import). None means forwarding is off
+# or not yet configured; log_access() must tolerate that quietly.
+_siem_config_provider = None
+
+
+def set_siem_config_provider(provider) -> None:
+    """provider: a zero-arg callable returning the current SIEM destinations
+    config dict (see app/siem_forwarding.normalize_config) - a callable
+    rather than a static dict so it always reflects the latest saved config,
+    even after an admin edits it via PUT /v1/siem/config."""
+    global _siem_config_provider
+    _siem_config_provider = provider
 
 
 class CouchbaseStore:
@@ -471,6 +489,19 @@ class CouchbaseStore:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to write audit log entry: %s", exc)
+            return
+
+        # Forward to any enabled SIEM destinations - fire-and-forget, never
+        # awaited, so a slow/unreachable external endpoint can never add
+        # latency to the discover/invoke/authenticate call that produced
+        # this entry (see app/siem_forwarding.py).
+        if _siem_config_provider is not None:
+            try:
+                siem_config = _siem_config_provider()
+                if siem_config and any(v.get("enabled") for v in siem_config.values()):
+                    asyncio.create_task(siem_forwarding.dispatch(doc, siem_config))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to schedule SIEM forwarding: %s", exc)
 
     async def recent_access_log(self, limit: int = 50) -> list[dict]:
         bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
@@ -487,6 +518,63 @@ class CouchbaseStore:
             return await asyncio.to_thread(_run)
         except Exception as exc:  # noqa: BLE001
             logger.warning("recent_access_log query failed: %s", exc)
+            return []
+
+    async def access_log_role_server_aggregate_since(self, since: str) -> list[dict]:
+        """One GROUP BY (role, server_id) aggregate over the audit log
+        within a time window - builds the Dashboard topology diagram's
+        agent -> MCP server edges. Only a successfully-authorized tool
+        invocation counts as a live connection (action=invoke,
+        decision=ALLOW, server_id present) - a denied call never reached
+        the tool. See idx_access_log_topology (couchbase-init/init.sh) for
+        why this is a pure index scan rather than a per-document KV fetch."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["access_log_collection"]
+
+        def _run():
+            q = (
+                f"SELECT e.`role` AS `role`, e.server_id AS server_id, COUNT(1) AS count, MAX(e.timestamp) AS last_at "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` e "
+                f"WHERE e.timestamp >= $since AND e.action = 'invoke' AND e.decision = 'ALLOW' "
+                f"AND e.server_id IS NOT MISSING AND e.`role` IS NOT MISSING "
+                f"GROUP BY e.`role`, e.server_id"
+            )
+            return list(self.cluster.query(q, QueryOptions(named_parameters={"since": since}, metrics=False)).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("access_log_role_server_aggregate_since query failed: %s", exc)
+            return []
+
+    async def access_log_decision_aggregate_since(self, since: str) -> list[dict]:
+        """One GROUP BY (decision) aggregate over the *entire* audit log
+        within a time window - powers the Dashboard's "Access Events (24h)"
+        stat tile and its Allow/Deny/Error breakdown. This is a real
+        COUNT(1) over every matching row in the window, unlike
+        recent_access_log(limit=N): that call is capped at
+        INSIGHTS_LOOKBACK_ENTRIES (default 1000) most-recent rows, so once
+        24h of traffic exceeds that cap, counting from it just reports the
+        cap back (e.g. a permanently-flat "1000") instead of the true
+        total. GROUP BY decision keeps this a single index/aggregate scan
+        rather than a per-document fetch, same as
+        access_log_role_server_aggregate_since above."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["access_log_collection"]
+
+        def _run():
+            q = (
+                f"SELECT e.decision AS decision, COUNT(1) AS count "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` e "
+                f"WHERE e.timestamp >= $since "
+                f"GROUP BY e.decision"
+            )
+            return list(self.cluster.query(q, QueryOptions(named_parameters={"since": since}, metrics=False)).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("access_log_decision_aggregate_since query failed: %s", exc)
             return []
 
     # -- LLM response cache ----------------------------------------------------
@@ -849,6 +937,32 @@ class CouchbaseStore:
             return await asyncio.to_thread(_run)
         except Exception as exc:  # noqa: BLE001
             logger.warning("recent_llm_events query failed: %s", exc)
+            return []
+
+    async def llm_role_provider_aggregate_since(self, since: str) -> list[dict]:
+        """One GROUP BY (role, provider) aggregate over the LLM cache event
+        log within a time window - the Dashboard topology diagram's
+        agent -> LLM provider edges. Every completion counts, hit or miss -
+        a cache hit is still the agent reaching the LLM Caching gateway for
+        that provider, even though no tokens left the building. See
+        idx_llm_cache_log_topology (couchbase-init/init.sh) for why this is
+        a pure index scan."""
+        bucket, scope = COUCHBASE_CONFIG["bucket"], COUCHBASE_CONFIG["scope"]
+        coll = COUCHBASE_CONFIG["llm_cache_log_collection"]
+
+        def _run():
+            q = (
+                f"SELECT e.`role` AS `role`, e.provider AS provider, COUNT(1) AS count, MAX(e.timestamp) AS last_at "
+                f"FROM `{bucket}`.`{scope}`.`{coll}` e "
+                f"WHERE e.timestamp >= $since AND e.`role` IS NOT MISSING AND e.provider IS NOT MISSING "
+                f"GROUP BY e.`role`, e.provider"
+            )
+            return list(self.cluster.query(q, QueryOptions(named_parameters={"since": since}, metrics=False)).rows())
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("llm_role_provider_aggregate_since query failed: %s", exc)
             return []
 
     async def llm_dashboard_aggregate_since(self, since: str) -> list[dict]:
@@ -1288,7 +1402,7 @@ class CouchbaseStore:
         def _run():
             # password_hash never leaves Couchbase for a list call.
             q = (
-                f"SELECT META(u).id AS username, u.role, u.source, u.active, u.must_change_password, "
+                f"SELECT META(u).id AS username, u.`role`, u.source, u.active, u.must_change_password, "
                 f"u.password_hash, u.created_at, u.updated_at, u.last_login_at "
                 f"FROM `{bucket}`.`{scope}`.`{coll}` u ORDER BY META(u).id"
             )

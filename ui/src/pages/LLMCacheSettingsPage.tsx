@@ -163,7 +163,11 @@ export function LLMCacheSettingsPage() {
                     {p.label}
                   </div>
                   <div className="stat-hint">
-                    {selected ? "Selected - agents route here" : `Set ${p.env_key} in .env to call it live`}
+                    {selected
+                      ? "Selected - agents route here"
+                      : !p.api_key_configured
+                      ? `Set ${p.env_key} in .env to call it live`
+                      : null}
                   </div>
                 </div>
               );

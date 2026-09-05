@@ -160,6 +160,10 @@ DEFAULT_ADMIN_USERNAME = os.getenv("DEFAULT_ADMIN_USERNAME", "admin")
 # settings::<name> convention as settings::llm_cache) - see app/user_auth.py.
 LDAP_SETTINGS_DOC = "settings::ldap"
 
+# Couchbase settings-collection doc id for the SIEM/log-forwarding
+# destinations (same settings::<name> convention) - see app/siem_forwarding.py.
+SIEM_SETTINGS_DOC = "settings::siem"
+
 
 # ---------------------------------------------------------------------------
 # HTTPS server certificate (see Settings -> HTTPS Certificate, app/user_auth.py)

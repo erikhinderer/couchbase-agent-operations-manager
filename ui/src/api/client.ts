@@ -17,9 +17,11 @@ import type {
   Role,
   SdkInfo,
   ServerDoc,
+  SiemConfigResponse,
   SkillInfo,
   ThreatDetectionResponse,
   ToolDoc,
+  TopologyResponse,
 } from "./types";
 
 class ApiError extends Error {
@@ -115,6 +117,18 @@ export const api = {
       body: JSON.stringify({ ca_certificate: caCertificate }),
     }),
 
+  siemConfig: () => request<SiemConfigResponse>("/v1/siem/config"),
+  saveSiemConfig: (vendor: string, config: Record<string, unknown>) =>
+    request<{ config: SiemConfigResponse["config"] }>(`/v1/siem/config/${vendor}`, {
+      method: "PUT",
+      body: JSON.stringify({ config }),
+    }),
+  testSiemConfig: (vendor: string, config?: Record<string, unknown>) =>
+    request<{ success: boolean; detail: string }>(`/v1/siem/test/${vendor}`, {
+      method: "POST",
+      body: JSON.stringify({ config }),
+    }),
+
   tlsCert: () => request<{ info: ServerCertificateInfo | null; can_revert: boolean }>("/v1/auth/tls-cert"),
   validateTlsCert: (certPem: string, keyPem: string) =>
     request<{ valid: boolean; info: ServerCertificateInfo }>("/v1/auth/tls-cert/validate", {
@@ -163,6 +177,7 @@ export const api = {
   auditLog: (limit = 100) => request<{ entries: AuditLogEntry[] }>(`/v1/audit-log?limit=${limit}`),
 
   dashboard: () => request<DashboardResponse>("/v1/dashboard"),
+  topology: (windowHours = 24) => request<TopologyResponse>(`/v1/topology?window_hours=${windowHours}`),
   insights: () => request<{ findings: Finding[] }>("/v1/insights"),
 
   discover: (apiKey: string, query: string, topK: number) =>

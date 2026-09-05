@@ -36,7 +36,7 @@ export function DashboardPage() {
         <div>
           <h1 className="page-title">Dashboard</h1>
           <p className="page-subtitle">
-            {data ? `${data.events_examined} access-log event(s) examined in the most recent lookback window` : "Loading..."}
+            {data ? `${data.summary.access_events_24h.toLocaleString()} access-log event(s) in the last 24 hours` : "Loading..."}
           </p>
         </div>
         <button className="btn btn-primary" onClick={load} disabled={loading}>

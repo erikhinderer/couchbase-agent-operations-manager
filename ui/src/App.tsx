@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { Sidebar } from "./components/nav/Sidebar";
 import { DashboardPage } from "./pages/DashboardPage";
+import { TopologyPage } from "./pages/TopologyPage";
 import { ServersPage } from "./pages/ServersPage";
 import { CatalogPage } from "./pages/CatalogPage";
 import { LLMCachePage } from "./pages/LLMCachePage";
@@ -54,6 +55,7 @@ export default function App() {
       <main className="main">
         <Routes>
           <Route path="/" element={<DashboardPage />} />
+          <Route path="/topology" element={<TopologyPage />} />
           <Route path="/servers" element={<ServersPage />} />
           <Route path="/catalog" element={<CatalogPage />} />
           <Route path="/llm-caching" element={<LLMCachePage />} />

@@ -112,8 +112,18 @@ done
 # each falls back to a full primary-index scan that gets slower as
 # llm_cache_log grows - see app/couchbase_client.py's recent_llm_events()
 # and recent_llm_events_since().
-curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
-  -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_timestamp ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp)" > /dev/null || true
+# Every CREATE INDEX call below captures its response and prints it when
+# Couchbase's query service reports an error (it returns HTTP 200 with an
+# "errors" array even on failure - e.g. a reserved N1QL word used as a
+# bare identifier - so a plain "> /dev/null || true" swallows that kind of
+# failure completely and silently, which is exactly what let a bug in the
+# two topology indexes below go undetected for a while: `role` is a
+# reserved word in N1QL, so an earlier revision of this script that used
+# it unquoted in the index-key list failed on every single run without
+# ever showing up here.
+IDX_TIMESTAMP_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+  -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_timestamp ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp)")
+echo "${IDX_TIMESTAMP_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_llm_cache_log_timestamp: ${IDX_TIMESTAMP_OUTPUT}"
 
 # Covering index for the LLM Caching dashboard's aggregate query (see
 # app/couchbase_client.py's llm_dashboard_aggregate_since) - one GROUP BY
@@ -126,8 +136,26 @@ curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
 # every dashboard load or 30s auto-refresh, which is what made the page
 # take multiple seconds to load. Listing every referenced field here lets
 # the same query run as a pure index scan instead.
-curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
-  -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_agg ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, outcome, provider, model, tokens_saved, total_tokens, cost_saved_usd, cost_usd, latency_saved_ms, latency_ms)" > /dev/null || true
+IDX_AGG_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+  -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_agg ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, outcome, provider, model, tokens_saved, total_tokens, cost_saved_usd, cost_usd, latency_saved_ms, latency_ms)")
+echo "${IDX_AGG_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_llm_cache_log_agg: ${IDX_AGG_OUTPUT}"
+
+# Covering indexes for the Dashboard's live topology diagram (see
+# app/couchbase_client.py's access_log_role_server_aggregate_since /
+# llm_role_provider_aggregate_since) - each is a GROUP BY (role, <system>)
+# over a time window to build the agent -> MCP server and agent -> LLM
+# provider edge counts. Same reasoning as idx_llm_cache_log_agg above:
+# without role/server_id (resp. role/provider) present in the index, N1QL
+# has to KV-fetch every matching document just to read those two fields.
+# `role` must stay backtick-quoted - see the WARNING comment above this
+# block for why.
+IDX_ACCESS_TOPOLOGY_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+  -d "statement=CREATE INDEX IF NOT EXISTS idx_access_log_topology ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`access_log\`(timestamp, action, decision, \`role\`, server_id)")
+echo "${IDX_ACCESS_TOPOLOGY_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_access_log_topology: ${IDX_ACCESS_TOPOLOGY_OUTPUT}"
+
+IDX_LLM_TOPOLOGY_OUTPUT=$(curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+  -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_topology ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, \`role\`, provider)")
+echo "${IDX_LLM_TOPOLOGY_OUTPUT}" | grep -q '"errors"' && echo "[couchbase-init] WARNING: idx_llm_cache_log_topology: ${IDX_LLM_TOPOLOGY_OUTPUT}"
 
 echo "[couchbase-init] Couchbase provisioning complete."
 

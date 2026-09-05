@@ -14,7 +14,10 @@ type NavSection = {
 const NAV_SECTIONS: NavSection[] = [
   {
     label: "Overview",
-    items: [{ to: "/", icon: "▦", text: "Dashboard", exact: true }],
+    items: [
+      { to: "/", icon: "▦", text: "Dashboard", exact: true },
+      { to: "/topology", icon: "⛓", text: "Live Topology" },
+    ],
   },
   {
     label: "Registry",

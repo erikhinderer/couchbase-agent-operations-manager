@@ -352,6 +352,78 @@ export interface LdapConfig {
   ca_certificate_info: CaCertificateInfo | null;
 }
 
+// -- SIEM / log-forwarding destinations (Audit Log page) --------------------
+// Each destination's config is a loose bag of vendor-specific fields (see
+// operations-manager/app/siem_forwarding.py DEFAULT_DESTINATIONS) - always
+// includes "enabled", plus one "<field>_set": boolean per secret field the
+// backend never returns in plaintext.
+export interface SiemDestinationConfig {
+  enabled: boolean;
+  [field: string]: string | number | boolean;
+}
+
+export interface SiemDeliveryStatus {
+  status: "ok" | "error";
+  detail: string;
+  at: string;
+}
+
+export interface SiemConfigResponse {
+  config: Record<string, SiemDestinationConfig>;
+  status: Record<string, SiemDeliveryStatus>;
+  vendors: Record<string, string>;
+}
+
+// -- Dashboard topology diagram ---------------------------------------------
+// Live connectivity graph: which RBAC roles have actually reached which MCP
+// tool servers and LLM providers within the lookback window (see
+// GET /v1/topology) - not just what's registered, but what's active.
+export interface TopologyAgent {
+  role: string;
+  description: string;
+  tool_calls: number;
+  llm_calls: number;
+  last_active_at: string | null;
+}
+
+export interface TopologyServer {
+  server_id: string;
+  label: string;
+  owner: string | null;
+  trust_status: string;
+  tool_count: number;
+  calls: number;
+  last_active_at: string | null;
+}
+
+export interface TopologyLlmProvider {
+  provider: string;
+  label: string;
+  vendor: string;
+  configured: boolean;
+  caching_enabled: boolean;
+  is_default: boolean;
+  calls: number;
+  last_active_at: string | null;
+}
+
+export interface TopologyEdge {
+  role: string;
+  server_id?: string;
+  provider?: string;
+  count: number;
+  last_at: string | null;
+}
+
+export interface TopologyResponse {
+  generated_at: string;
+  window_hours: number;
+  agents: TopologyAgent[];
+  servers: TopologyServer[];
+  llm_providers: TopologyLlmProvider[];
+  edges: { agent_server: TopologyEdge[]; agent_llm: TopologyEdge[] };
+}
+
 export interface CaCertificateInfo {
   subject: string;
   issuer: string;

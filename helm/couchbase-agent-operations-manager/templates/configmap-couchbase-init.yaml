@@ -114,4 +114,13 @@ data:
     curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
       -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_agg ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, outcome, provider, model, tokens_saved, total_tokens, cost_saved_usd, cost_usd, latency_saved_ms, latency_ms)" > /dev/null || true
 
+    # Covering indexes for the Dashboard's live topology diagram (see
+    # app/couchbase_client.py's access_log_role_server_aggregate_since /
+    # llm_role_provider_aggregate_since in the main repo, kept in sync with
+    # couchbase-init/init.sh manually).
+    curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+      -d "statement=CREATE INDEX IF NOT EXISTS idx_access_log_topology ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`access_log\`(timestamp, action, decision, role, server_id)" > /dev/null || true
+    curl -s -u "${CB_USER}:${CB_PASS}" http://${CB_HOST}:8093/query/service \
+      -d "statement=CREATE INDEX IF NOT EXISTS idx_llm_cache_log_topology ON \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`llm_cache_log\`(timestamp, role, provider)" > /dev/null || true
+
     echo "[couchbase-init] Couchbase provisioning complete."

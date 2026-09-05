@@ -43,6 +43,10 @@
   --blue-bg: rgba(91, 157, 245, 0.14);
   --blue-border: rgba(91, 157, 245, 0.4);
 
+  --purple: #7c5cbf;
+  --purple-bg: rgba(124, 92, 191, 0.14);
+  --purple-border: rgba(124, 92, 191, 0.4);
+
   --gray-bg: rgba(139, 147, 166, 0.14);
   --gray-border: rgba(139, 147, 166, 0.35);
 
@@ -79,6 +83,8 @@
   --green: #3ecf8e;
   --blue: #5b9df5;
   --teal: #2dd4c8;
+  --purple: #a78bfa;
+
 }
 
 /* The active nav item gets a solid red fill with white text by default
@@ -770,6 +776,21 @@ table.data-table {
   font-size: 12.5px;
   margin-bottom: 16px;
   line-height: 1.5;
+}
+
+/* Neutral/grey variant - for explanatory "how it works" context rather
+   than a warning or something needing attention (the default amber reads
+   as caution, which is wrong for a page that's purely informational). */
+.helper-banner-neutral {
+  background: var(--gray-bg);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.helper-banner-heading {
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
 }
 
 .loading-note,

@@ -29,9 +29,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app import agent_memory, hijack_detection, insights, llm_cache, mcp_client, sdk_packaging, skill_packaging, user_auth
+from app import agent_memory, hijack_detection, insights, llm_cache, mcp_client, sdk_packaging, siem_forwarding, skill_packaging, user_auth
 from app.catalog_ingest import ingest_all, ingest_server, rescan_all_tools, seed_servers
-from app.couchbase_client import CouchbaseStore
+from app.couchbase_client import CouchbaseStore, set_siem_config_provider
 from app.embeddings import ToolEmbeddings
 from app.rbac_policy import ROLES
 from config import (
@@ -50,6 +50,7 @@ from config import (
     LLM_CACHE_DEFAULTS,
     SAMPLE_MCP_SERVERS_BASE_URL,
     SEED_API_KEYS,
+    SIEM_SETTINGS_DOC,
 )
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -176,6 +177,13 @@ last_llm_sweep_at: str | None = None
 # round-trip just to find out whether LDAP is even enabled.
 ldap_config: dict = user_auth.normalize_ldap_config(None)
 
+# SIEM/log-forwarding destinations (see app/siem_forwarding.py). Same
+# load-once-into-memory convention as ldap_config/llm_config above - the
+# hot path here is every single audit log write (couchbase_client.log_access),
+# so it must never cost a Couchbase round-trip just to find out whether
+# forwarding is even enabled.
+siem_config: dict = siem_forwarding.normalize_config(None)
+
 
 @app.on_event("startup")
 async def startup():
@@ -207,6 +215,8 @@ async def startup():
 
         await seed_default_admin()
         await load_ldap_config()
+        await load_siem_config()
+        set_siem_config_provider(lambda: siem_config)
 
         await seed_servers(store, SAMPLE_MCP_SERVERS_BASE_URL)
 
@@ -300,6 +310,28 @@ async def save_ldap_config(cfg: dict):
         },
     )
     _warn_if_ldap_tls_unverified(ldap_config)
+
+
+async def load_siem_config():
+    global siem_config
+    stored = await store.get_setting(SIEM_SETTINGS_DOC)
+    siem_config = siem_forwarding.normalize_config(stored.get("config") if stored else None)
+    enabled = [v for v, c in siem_config.items() if c.get("enabled")]
+    logger.info("SIEM forwarding config loaded (enabled destinations: %s)", ", ".join(enabled) or "none")
+
+
+async def save_siem_config(cfg: dict):
+    global siem_config
+    siem_config = siem_forwarding.normalize_config(cfg)
+    await store.upsert_setting(
+        SIEM_SETTINGS_DOC,
+        {
+            "doc_type": "settings",
+            "setting_id": "siem",
+            "config": siem_config,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
 
 
 async def load_llm_config():
@@ -462,6 +494,19 @@ class LdapTestRequest(BaseModel):
 
 class LdapCaCertificateRequest(BaseModel):
     ca_certificate: str
+
+
+class SiemVendorConfigRequest(BaseModel):
+    # Raw per-field dict for one vendor, same "server validates, this is
+    # just a bag of fields" convention as LdapConfigRequest.config. Any
+    # secret field present here (see siem_forwarding.SECRET_FIELDS) is
+    # plaintext and gets encrypted before storage; omitted/blank leaves the
+    # secret already on file untouched.
+    config: dict
+
+
+class SiemTestRequest(BaseModel):
+    config: dict | None = None  # optional unsaved edits to test before saving
 
 
 class ServerCertificateRequest(BaseModel):
@@ -862,15 +907,27 @@ async def dashboard():
     log_entries = await store.recent_access_log(limit=INSIGHTS_LOOKBACK_ENTRIES)
 
     findings = insights.compute_insights(servers, tools, log_entries)
-    decisions = insights.decision_breakdown(log_entries)
     actions = insights.action_breakdown(log_entries)
     hourly = insights.hourly_volume(log_entries, buckets=12)
 
+    # "Access Events (24h)" and its Allow/Deny/Error breakdown need a real
+    # COUNT(1) over the full 24h window, not a count over the most-recent
+    # INSIGHTS_LOOKBACK_ENTRIES rows - once true 24h volume exceeds that
+    # cap (the common case once a demo has been running a while), counting
+    # from the capped sample just reports the cap back as a permanently
+    # flat number instead of the actual total. See
+    # couchbase_client.access_log_decision_aggregate_since.
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    events_24h = sum(1 for e in log_entries if (e.get("timestamp") or "") >= cutoff)
+    decision_rows = await store.access_log_decision_aggregate_since(cutoff)
+    decision_counts = {row.get("decision"): int(row.get("count") or 0) for row in decision_rows}
+    decisions = {
+        "ALLOW": decision_counts.get("ALLOW", 0),
+        "DENY": decision_counts.get("DENY", 0),
+        "ERROR": decision_counts.get("ERROR", 0),
+    }
 
-    total_decisions = decisions["ALLOW"] + decisions["DENY"] + decisions["ERROR"]
-    deny_rate_pct = round((decisions["DENY"] / total_decisions) * 100, 1) if total_decisions else 0.0
+    events_24h = sum(decisions.values())
+    deny_rate_pct = round((decisions["DENY"] / events_24h) * 100, 1) if events_24h else 0.0
 
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -889,6 +946,99 @@ async def dashboard():
         "action_breakdown": actions,
         "hourly_volume": hourly,
         "top_findings": findings[:5],
+    }
+
+
+@app.get("/v1/topology")
+async def topology(window_hours: int = 24):
+    """Live connectivity graph for the Dashboard: which RBAC roles have
+    actually reached which MCP tool servers and which LLM providers in the
+    last `window_hours` - not just what's registered, but what's active.
+    Two GROUP BY aggregates (never a raw per-event fetch - see
+    couchbase_client.access_log_role_server_aggregate_since /
+    llm_role_provider_aggregate_since) plus the code-defined role/provider
+    catalogs and the server registry."""
+    window_hours = max(1, min(window_hours, 24 * 7))
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - window_hours * 3600))
+
+    servers = await store.list_servers()
+    tool_agg_rows, llm_agg_rows = await asyncio.gather(
+        store.access_log_role_server_aggregate_since(since),
+        store.llm_role_provider_aggregate_since(since),
+    )
+
+    server_calls: dict[str, int] = {}
+    server_last: dict[str, str] = {}
+    agent_tool_calls: dict[str, int] = {}
+    agent_last: dict[str, str] = {}
+    edges_agent_server = []
+    for row in tool_agg_rows:
+        role, server_id = row.get("role"), row.get("server_id")
+        count, last_at = int(row.get("count") or 0), row.get("last_at")
+        edges_agent_server.append({"role": role, "server_id": server_id, "count": count, "last_at": last_at})
+        server_calls[server_id] = server_calls.get(server_id, 0) + count
+        server_last[server_id] = max(last_at or "", server_last.get(server_id, ""))
+        agent_tool_calls[role] = agent_tool_calls.get(role, 0) + count
+        agent_last[role] = max(last_at or "", agent_last.get(role, ""))
+
+    provider_calls: dict[str, int] = {}
+    provider_last: dict[str, str] = {}
+    agent_llm_calls: dict[str, int] = {}
+    edges_agent_llm = []
+    for row in llm_agg_rows:
+        role, provider = row.get("role"), row.get("provider")
+        count, last_at = int(row.get("count") or 0), row.get("last_at")
+        edges_agent_llm.append({"role": role, "provider": provider, "count": count, "last_at": last_at})
+        provider_calls[provider] = provider_calls.get(provider, 0) + count
+        provider_last[provider] = max(last_at or "", provider_last.get(provider, ""))
+        agent_llm_calls[role] = agent_llm_calls.get(role, 0) + count
+        agent_last[role] = max(last_at or "", agent_last.get(role, ""))
+
+    agents = [
+        {
+            "role": role_id,
+            "description": description,
+            "tool_calls": agent_tool_calls.get(role_id, 0),
+            "llm_calls": agent_llm_calls.get(role_id, 0),
+            "last_active_at": agent_last.get(role_id) or None,
+        }
+        for role_id, description in ROLES.items()
+    ]
+
+    server_nodes = [
+        {
+            "server_id": s["server_id"],
+            "label": s.get("label") or s["server_id"],
+            "owner": s.get("owner"),
+            "trust_status": s.get("trust_status"),
+            "tool_count": s.get("tool_count", 0),
+            "calls": server_calls.get(s["server_id"], 0),
+            "last_active_at": server_last.get(s["server_id"]) or None,
+        }
+        for s in servers
+    ]
+
+    llm_providers = [
+        {
+            "provider": key,
+            "label": spec.get("label", key),
+            "vendor": spec.get("vendor", key),
+            "configured": bool((LLM_API_KEYS.get(key) or "").strip()),
+            "caching_enabled": bool(llm_config.get("enabled")),
+            "is_default": key == llm_config.get("provider"),
+            "calls": provider_calls.get(key, 0),
+            "last_active_at": provider_last.get(key) or None,
+        }
+        for key, spec in llm_cache.PROVIDERS.items()
+    ]
+
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "window_hours": window_hours,
+        "agents": agents,
+        "servers": server_nodes,
+        "llm_providers": llm_providers,
+        "edges": {"agent_server": edges_agent_server, "agent_llm": edges_agent_llm},
     }
 
 
@@ -1798,6 +1948,52 @@ async def test_ldap_config(req: LdapTestRequest, request: Request):
     require_admin(request)
     success, detail, is_admin = await user_auth.ldap_authenticate(ldap_config, req.username, req.password)
     return {"success": success, "detail": detail, "would_be_admin": is_admin}
+
+
+# -- Settings -> Audit Log Forwarding (SIEM) (admin only) --------------------
+# Six named destinations for the Audit Log's append-only Couchbase stream -
+# see app/siem_forwarding.py for the per-vendor adapters and the encryption
+# convention (same Fernet-at-rest scheme as the LDAP bind password above).
+
+@app.get("/v1/siem/config")
+async def get_siem_config(request: Request):
+    require_admin(request)
+    return {
+        "config": siem_forwarding.public_config(siem_config),
+        "status": siem_forwarding.status_snapshot(),
+        "vendors": siem_forwarding.VENDOR_LABELS,
+    }
+
+
+@app.put("/v1/siem/config/{vendor}")
+async def put_siem_config(vendor: str, req: SiemVendorConfigRequest, request: Request):
+    """Save one destination's config. Non-secret fields overwrite outright;
+    any secret field present in req.config (plaintext) is encrypted and
+    replaces the stored secret, and one omitted/blank leaves the existing
+    stored secret untouched - see siem_forwarding.apply_secrets."""
+    require_admin(request)
+    if vendor not in siem_forwarding.DEFAULT_DESTINATIONS:
+        raise HTTPException(status_code=404, detail=f"Unknown SIEM destination '{vendor}'")
+    merged_full = {**siem_config, vendor: {**siem_config.get(vendor, {}), **req.config}}
+    normalized = siem_forwarding.normalize_config(merged_full)
+    normalized[vendor] = siem_forwarding.apply_secrets(vendor, normalized[vendor], req.config)
+    await save_siem_config(normalized)
+    return {"config": siem_forwarding.public_config(siem_config)}
+
+
+@app.post("/v1/siem/test/{vendor}")
+async def test_siem_config(vendor: str, req: SiemTestRequest, request: Request):
+    """Send one synthetic test event to this destination right now, using
+    the saved config plus any unsaved edits from the settings form - so an
+    admin can validate before committing Save."""
+    require_admin(request)
+    if vendor not in siem_forwarding.DEFAULT_DESTINATIONS:
+        raise HTTPException(status_code=404, detail=f"Unknown SIEM destination '{vendor}'")
+    candidate_full = {**siem_config, vendor: {**siem_config.get(vendor, {}), **(req.config or {})}}
+    normalized = siem_forwarding.normalize_config(candidate_full)
+    vendor_cfg = siem_forwarding.apply_secrets(vendor, normalized[vendor], req.config or {})
+    result = await asyncio.to_thread(siem_forwarding.test_one, vendor, vendor_cfg)
+    return result
 
 
 # -- Settings -> HTTPS Certificate (admin only) ------------------------------
